@@ -1,0 +1,32 @@
+NORTHSTAR TEAM DIRECTORY
+Updated: August 2026
+
+MAYA CHEN
+Role: Product Manager
+Team: Product
+Location: Singapore
+Primary responsibility: Product roadmap and customer requirements.
+
+RAHUL MENON
+Role: Senior Software Engineer
+Team: Platform
+Location: Bengaluru
+Primary responsibility: Backend services and infrastructure.
+
+ELENA TORRES
+Role: UX Designer
+Team: Design
+Location: Madrid
+Primary responsibility: User research and interface design.
+
+JONATHAN REED
+Role: IT Administrator
+Team: Information Technology
+Location: London
+Primary responsibility: Device management and security operations.
+
+TEAM CONTACT RULE
+
+Questions about employee benefits should go to People Operations.
+Questions about device security should go to Information Technology.
+Questions about product priorities should go to the Product team.

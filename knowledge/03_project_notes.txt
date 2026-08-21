@@ -1,0 +1,35 @@
+PROJECT ORION — INTERNAL NOTES
+Last Updated: August 10, 2026
+
+OBJECTIVE
+
+Project Orion is a local-first personal assistant designed to operate without requiring cloud inference for normal conversations.
+
+CURRENT ARCHITECTURE
+
+The assistant uses three major subsystems:
+
+1. Conversation layer
+   Handles user interaction and sends prompts to the language model.
+
+2. Memory layer
+   Stores durable user facts in a local SQLite database. It uses structured facts, embeddings, semantic retrieval, and a small hot-memory cache.
+
+3. Document layer
+   Indexes local PDF and TXT files. Documents are extracted, chunked, embedded, and retrieved when relevant to a user query.
+
+DESIGN PRINCIPLE
+
+User memory and document knowledge must remain separate. A statement found inside a document must not automatically become a user memory.
+
+CURRENT DOCUMENT RETRIEVAL TARGET
+
+The initial document retrieval system is designed for local files. It should prefer relevant chunks rather than injecting entire documents into the language-model context.
+
+FUTURE WORK
+
+Potential future formats include Markdown, DOCX, and CSV. OCR support for scanned PDFs may also be added later.
+
+TESTING GOAL
+
+The system should correctly identify when a question is about a document, retrieve the appropriate source, and avoid using unrelated documents as evidence.

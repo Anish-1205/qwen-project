@@ -1,0 +1,27 @@
+ACME NORTHSTAR — EMPLOYEE POLICY HANDBOOK
+Version: 3.2
+Effective Date: January 15, 2026
+
+REMOTE WORK POLICY
+
+Employees may work remotely up to three days per week with manager approval. Remote work requests should be submitted at least two business days before the requested remote day.
+
+Employees working remotely must remain available between 10:00 AM and 4:00 PM local time. Meetings scheduled during those hours take priority over individual work.
+
+ANNUAL LEAVE
+
+Full-time employees receive 24 days of paid annual leave per calendar year. Leave requests longer than five consecutive business days require approval from the employee's department director.
+
+SICK LEAVE
+
+Employees receive 12 days of paid sick leave per calendar year. Sick leave does not require advance approval, but employees should notify their manager as soon as reasonably possible.
+
+EQUIPMENT
+
+The company provides one standard laptop and one external monitor to eligible remote employees. Additional equipment requires approval from the IT department.
+
+SECURITY
+
+Company laptops must use full-disk encryption, automatic screen locking after 10 minutes of inactivity, and multi-factor authentication.
+
+Questions about this policy should be directed to the People Operations team.

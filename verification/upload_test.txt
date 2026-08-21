@@ -1,0 +1,3 @@
+The azure orchid is a fictional test document.
+The secret code phrase is ORCHID-427.
+If asked about this document, answer that the secret code phrase is ORCHID-427.

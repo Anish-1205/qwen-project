@@ -1,0 +1,29 @@
+NORTHSTAR X200 DEVICE — USER MANUAL
+Model: X200
+Revision: 4
+
+POWER
+
+The X200 requires a 65-watt USB-C power adapter. The device can operate while charging.
+
+BATTERY
+
+A fully charged battery provides approximately 11 hours of typical mixed-use operation. Battery life may be lower under sustained high CPU usage.
+
+RESET PROCEDURE
+
+To perform a soft reset, hold the power button for 8 seconds and release it. Wait approximately 15 seconds before turning the device on again.
+
+If the soft reset does not resolve the problem, disconnect all external devices and hold the power button for 15 seconds.
+
+CONNECTIVITY
+
+The X200 supports Wi-Fi 6 and Bluetooth 5.3. The device supports up to two external displays through compatible USB-C or docking hardware.
+
+STORAGE
+
+The standard X200 configuration includes a 512 GB NVMe SSD. Storage is not user-replaceable.
+
+WARNING
+
+Do not open the device enclosure while the device is connected to power. Internal components should only be serviced by authorized technicians.

@@ -1,0 +1,32 @@
+# Virtual environments
+.venv/
+qwen-env/
+venv/
+
+# Python-generated files and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor and operating-system metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local runtime data
+data/
+database_backups/
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# Generated verification output (keep text fixtures in verification/)
+verification/*.json
+
+# Local model/training artifacts
+qwen2.5-3b-lora-adapter/
+checkpoints/

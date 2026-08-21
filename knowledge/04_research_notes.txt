@@ -1,0 +1,25 @@
+RESEARCH NOTES — LOCAL AI MEMORY SYSTEMS
+
+TOPIC: MEMORY RETRIEVAL STRATEGIES
+
+Structured memory stores information as explicit fields such as entity, relation, and value. This approach is useful when exact relationships need to be inspected or updated.
+
+Semantic memory uses vector embeddings to represent meaning. A query can then be compared against stored memories using a similarity measure.
+
+Hierarchical memory separates frequently useful information from less frequently accessed information. A small working-memory layer can reduce the amount of information that must be considered on every request.
+
+TEMPORAL MEMORY
+
+When a fact changes, deleting the previous value can destroy useful history. An alternative is to mark the previous fact as inactive while retaining its timestamp and replacement information.
+
+DOCUMENT RETRIEVAL
+
+For external documents, a common pipeline is:
+
+document discovery -> text extraction -> chunking -> embedding -> indexing -> retrieval -> context assembly
+
+Retrieving only relevant chunks generally reduces context usage compared with supplying entire documents.
+
+IMPORTANT DISTINCTION
+
+A document retrieval system answers questions about external knowledge. A personal memory system answers questions about remembered information concerning the user. These systems can cooperate but should not automatically merge their stored data.
