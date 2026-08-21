@@ -4,9 +4,9 @@ A private, local-first assistant built around `Qwen/Qwen2.5-3B-Instruct`. It
 combines conversational history, durable user memory, TXT/PDF retrieval, and a
 small allowlisted tool system behind CLI and FastAPI interfaces.
 
-The model and embeddings run locally after their first download. The weather
-and webpage tools are the only production features that intentionally make
-outbound requests.
+The model and embeddings run locally after their first download. The weather,
+daily reference-rate, Tavily web-search, and webpage tools are the only production
+features that intentionally make outbound requests.
 
 ## Features
 
@@ -14,8 +14,9 @@ outbound requests.
 - Stateful CLI and browser UI, plus a stateless CLI variant.
 - SQLite-backed user memory and web chat sessions.
 - Recursive TXT/PDF indexing with sentence-aware chunking and semantic search.
-- Validated tools for calculations, random values, weather, webpage text,
-  local file reading, directory listing, and spreadsheet analysis.
+- Validated tools for calculations, random values, daily currency reference
+  rates, structured web search, weather, webpage text, local file reading,
+  directory listing, and spreadsheet analysis.
 - Hybrid deterministic/model intent routing and bounded context compression.
 - A broad test suite that does not require loading Qwen for normal unit tests.
 
@@ -123,6 +124,14 @@ Storage and document settings can be overridden with environment variables:
 Tool safety and size limits use `TOOLS_*` variables documented alongside their
 defaults in [`tools/config.py`](tools/config.py). Private-network webpage access
 is disabled unless `TOOLS_ALLOW_PRIVATE_WEB_HOSTS=true` is explicitly set.
+Structured web search is disabled unless `TAVILY_API_KEY` is present in the
+process environment. The key is sent only to Tavily's fixed search endpoint in
+the authorization header and is never a model-supplied tool argument. For a
+PowerShell session, configure it before starting the application:
+
+```powershell
+$env:TAVILY_API_KEY = "<your-tavily-api-key>"
+```
 
 ## Tests
 
@@ -157,6 +166,10 @@ or the executable tool registry.
 
 ## Current limitations
 
+- Currency conversion uses daily central-bank reference rates, not intraday or
+  tradable market prices.
+- Web search requires a separately provisioned Tavily API key and returns
+  result metadata/snippets, not rendered or authenticated webpage content.
 - The dependency list is unpinned and a clean install is not yet continuously
   verified.
 - Web reset behavior and upload validation need hardening.

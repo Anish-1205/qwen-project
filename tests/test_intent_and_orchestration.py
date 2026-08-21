@@ -186,6 +186,37 @@ class DeterministicIntentRouterTests(unittest.TestCase):
         self.assertTrue(mixed.memory_write)
         self.assertTrue(mixed.document_read)
 
+    def test_webpage_routing_requires_current_turn_url_and_reading_action(self):
+        actionable = (
+            "Read https://example.com/report.",
+            "Summarize https://example.org/a and https://example.net/b",
+            "Compare https://example.com/one with https://example.com/two.",
+        )
+        non_actionable = (
+            "The project website is https://example.com.",
+            "Do not read https://example.com.",
+            "How do webpage fetchers work?",
+        )
+        for message in actionable:
+            with self.subTest(message=message):
+                evidence = self.router.analyze(message, [])
+                self.assertTrue(evidence.tool_use)
+                self.assertEqual(evidence.source_for("tool_use"), "deterministic")
+        for message in non_actionable:
+            with self.subTest(message=message):
+                evidence = self.router.analyze(message, [])
+                self.assertFalse(evidence.tool_use)
+                self.assertEqual(evidence.source_for("tool_use"), "deterministic")
+
+    def test_current_turn_webpage_urls_are_conservatively_normalized(self):
+        self.assertEqual(
+            self.router.current_turn_webpage_urls(
+                "Compare HTTPS://Example.COM/One?x=1 with https://example.org/two)."
+            ),
+            ("https://example.com/One?x=1", "https://example.org/two"),
+        )
+        self.assertEqual(self.router.current_turn_webpage_urls("Read that link."), ())
+
     def test_unfamiliar_standalone_question_delegates_ambiguous_flags_to_qwen(self):
         classifier = StaticClassifier(IntentDecision(False, False, True, False))
         orchestrator = QueueOrchestrator(
@@ -466,7 +497,7 @@ class OrchestrationRoutingTests(unittest.TestCase):
             {"role": "assistant", "content": "Qty Today is not applicable when Qty Plug is empty."},
         ]
         orchestrator, _, _, _ = self._run(
-            "Calculate Footage and Qty Today for every activity.",
+            "Describe how to determine Footage and Qty Today for every activity.",
             IntentDecision(False, False, False, True),
             history=history,
         )
@@ -476,7 +507,7 @@ class OrchestrationRoutingTests(unittest.TestCase):
         self.assertIn("fallbacks", response_messages[0]["content"])
         self.assertIn("conflicting earlier assistant answers", response_messages[0]["content"])
         self.assertEqual(response_messages[-3]["content"], rules)
-        self.assertEqual(response_messages[-1]["content"], "Calculate Footage and Qty Today for every activity.")
+        self.assertEqual(response_messages[-1]["content"], "Describe how to determine Footage and Qty Today for every activity.")
 
     def test_compression_keeps_complete_turns_and_preserves_user_rules(self):
         rules = (
@@ -546,7 +577,7 @@ class OrchestrationRoutingTests(unittest.TestCase):
         ]
 
         compressed, _, _, _ = orchestrator.process_turn(
-            "Calculate both fields.",
+            "Describe how to determine both fields.",
             messages,
             turn_number=3,
         )
@@ -558,7 +589,7 @@ class OrchestrationRoutingTests(unittest.TestCase):
         self.assertIn("conflicting assistant interpretations", summary_request[0]["content"])
         self.assertIn(preserved_summary, compressed[1]["content"])
         self.assertIn(preserved_summary, response_request[1]["content"])
-        self.assertEqual(response_request[-1]["content"], "Calculate both fields.")
+        self.assertEqual(response_request[-1]["content"], "Describe how to determine both fields.")
         self.assertEqual(
             [message["role"] for message in compressed],
             ["system", "system", "user", "assistant", "user", "assistant"],

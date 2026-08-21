@@ -26,6 +26,7 @@ database_backups/
 
 # Generated verification output (keep text fixtures in verification/)
 verification/*.json
+verification/TEST.txt
 
 # Local model/training artifacts
 qwen2.5-3b-lora-adapter/

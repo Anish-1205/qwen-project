@@ -4,12 +4,14 @@ from dataclasses import dataclass
 from typing import Any, Callable
 from . import config
 from .calculator import calculator
+from .currency_exchange import currency_exchange
 from .directory_listing import list_directory
 from .file_reader import read_file
 from .random_tools import random_number, roll_die
 from .spreadsheet import analyze_spreadsheet
 from .weather import weather
 from .web_fetch import fetch_webpage
+from .web_search import search_web
 
 @dataclass(frozen=True)
 class ToolDefinition:
@@ -17,6 +19,7 @@ class ToolDefinition:
     description: str
     function: Callable[..., Any]
     parameters: dict[str, Any]
+    provenance: str = "dedicated"
     def as_qwen_schema(self) -> dict[str, Any]:
         return {"type": "function", "function": {"name": self.name, "description": self.description, "parameters": self.parameters}}
 
@@ -34,12 +37,34 @@ def _object(properties: dict, required: list[str] | None = None) -> dict:
 def build_default_registry() -> ToolRegistry:
     r = ToolRegistry()
     integer = {"type": "integer", "minimum": -1_000_000_000, "maximum": 1_000_000_000}
-    r.register(ToolDefinition("roll_die", "Roll a die.", roll_die, _object({"sides": {"type": "integer", "minimum": 2, "maximum": 1_000_000, "default": 6}})))
-    r.register(ToolDefinition("random_number", "Return a random integer in an inclusive range.", random_number, _object({"minimum": integer, "maximum": integer}, ["minimum", "maximum"])))
+    r.register(ToolDefinition("roll_die", "Roll a die.", roll_die, _object({"sides": {"type": "integer", "minimum": 2, "maximum": 1_000_000, "default": 6}}), provenance="action"))
+    r.register(ToolDefinition("random_number", "Return a random integer in an inclusive range.", random_number, _object({"minimum": integer, "maximum": integer}, ["minimum", "maximum"]), provenance="action"))
     r.register(ToolDefinition("calculator", "Evaluate safe arithmetic or aggregate a supplied numeric list.", calculator, {"oneOf": [
         _object({"expression": {"type": "string", "minLength": 1, "maxLength": config.CALCULATOR_MAX_EXPRESSION_LENGTH}}, ["expression"]),
         _object({"aggregate": {"type": "string", "enum": ["sum", "min", "max", "mean", "count"]}, "values": {"type": "array", "items": {"type": "number"}, "maxItems": config.CALCULATOR_MAX_VALUES}}, ["aggregate", "values"])]}))
-    r.register(ToolDefinition("fetch_webpage", "Fetch an HTTP(S) page and return bounded readable text.", fetch_webpage, _object({"url": {"type": "string", "minLength": 8, "maxLength": config.WEB_MAX_URL_CHARS}}, ["url"])))
+    r.register(ToolDefinition(
+        "currency_exchange",
+        "Get a current or historical daily reference exchange rate and optionally convert an amount using Frankfurter; not for real-time trading prices.",
+        currency_exchange,
+        _object({
+            "base_currency": {"type": "string", "minLength": 3, "maxLength": 3},
+            "quote_currency": {"type": "string", "minLength": 3, "maxLength": 3},
+            "amount": {"type": "number", "minimum": 0, "maximum": config.CURRENCY_MAX_AMOUNT},
+            "date": {"type": "string", "minLength": 10, "maxLength": 10},
+        }, ["base_currency", "quote_currency"]),
+    ))
+    r.register(ToolDefinition(
+        "search_web",
+        "Search the public web with Tavily and return bounded titles, URLs, snippets, and available date metadata. Use this for web discovery; do not substitute fetch_webpage.",
+        search_web,
+        _object({
+            "query": {"type": "string", "minLength": 1, "maxLength": config.WEB_SEARCH_MAX_QUERY_CHARS},
+            "count": {"type": "integer", "minimum": 1, "maximum": config.WEB_SEARCH_MAX_RESULTS, "default": config.WEB_SEARCH_DEFAULT_RESULTS},
+            "freshness": {"type": "string", "enum": ["day", "week", "month", "year"]},
+        }, ["query"]),
+        provenance="discovery",
+    ))
+    r.register(ToolDefinition("fetch_webpage", "Read bounded text from a public HTTP(S) URL explicitly supplied in the current user turn; not for web search or fallback discovery.", fetch_webpage, _object({"url": {"type": "string", "minLength": 8, "maxLength": config.WEB_MAX_URL_CHARS}}, ["url"]), provenance="discovery"))
     r.register(ToolDefinition("weather", "Get current weather and a short forecast by place or coordinates.", weather, {"oneOf": [
         _object({"place": {"type": "string", "minLength": 1, "maxLength": 200}, "forecast_days": {"type": "integer", "minimum": 1, "maximum": config.WEATHER_MAX_FORECAST_DAYS, "default": 3}}, ["place"]),
         _object({"latitude": {"type": "number", "minimum": -90, "maximum": 90}, "longitude": {"type": "number", "minimum": -180, "maximum": 180}, "forecast_days": {"type": "integer", "minimum": 1, "maximum": config.WEATHER_MAX_FORECAST_DAYS, "default": 3}}, ["latitude", "longitude"])]}))

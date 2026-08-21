@@ -68,7 +68,7 @@ def debug_separator() -> str:
     return dim_text("" )
 
 
-_TAG_PATTERN = re.compile(r"\[(Memory Retrieval|Document Retrieval|Prompt Assembly|Router|Assistant Reply|Status|Documents|Tool Call|Tool Result)\]")
+_TAG_PATTERN = re.compile(r"\[(Memory Retrieval|Document Retrieval|Prompt Assembly|Router|Assistant Reply|Status|Documents|Tool Generation|Tool Call|Tool Result)\]")
 
 _SENSITIVE_FIELD = re.compile(r"(?:token|api_?key|access_?key|private_?key|secret|password|passwd|authorization|cookie|credential|session_?id)", re.I)
 _URL_IN_TEXT = re.compile(r"https?://[^\s\"'<>]+", re.I)

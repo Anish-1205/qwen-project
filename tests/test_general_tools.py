@@ -276,11 +276,20 @@ def test_routing_tool_flags_semantic_repair_and_mixed():
     assert directory.tool_use is True and directory.document_read is False and directory.complete
     for request in ("What's 2+2?", "Weather Pune", "What's Pune's temperature?", "Pick a number between 1 and 10", r"What does C:\notes.txt say?"):
         assert router.analyze(request, []).tool_use is not False
+    for request in (
+        "Roll a 20-sided die once, then calculate 37 * 19. Give me both results.",
+        "Roll a six-sided die twice, then use the calculator tool to add the two actual returned rolls.",
+        "Roll two six-sided dice.",
+    ):
+        decision = router.analyze(request, [])
+        assert decision.tool_use is True and decision.complete
     for request in ("What files are here?", "Which files are in this folder?", "What folders are here?", r"Which directories are in C:\Data?", "List data/", "List ~/Downloads", "Show data/reports", "Find in reports/2026", "List common files in this folder", "Show standard files in the current directory", r"List files normally found in C:\project", r"Which standard files are in C:\project?", "Extract text from report.pdf", "Inspect report.pdf", "Parse data.json", "Load report.xlsx", "In sales.csv, group rows by region", "In sales.csv, mean amount", "Limit sales.csv to 10 rows"):
         decision = router.analyze(request, [])
         assert decision.tool_use is True and decision.document_read is False
-    for discussion in ("How do current weather APIs work?", "Write Python code to fetch https://example.com", "Do not fetch https://example.com", "Show me how files and directories work", "Explain how to filter a spreadsheet", "Teach me how to group rows in a CSV", "Show code to filter sales.csv", "How can I filter sales.csv?", "How should I group sales.csv?", "What filter should I use on sales.csv?", "Can you explain how to filter sales.csv?", "Could you show me how to list files?", "Should I sort sales.csv by date?", "Do not group sales.csv by region", "Never aggregate sales.csv", "Do not limit sales.csv"):
+    for discussion in ("How do current weather APIs work?", "What is a spreadsheet?", "Write Python code to fetch https://example.com", "Do not fetch https://example.com", "Show me how files and directories work", "Explain how to filter a spreadsheet", "Teach me how to group rows in a CSV", "Show code to filter sales.csv", "How can I filter sales.csv?", "How should I group sales.csv?", "What filter should I use on sales.csv?", "Can you explain how to filter sales.csv?", "Could you show me how to list files?", "Should I sort sales.csv by date?", "Do not group sales.csv by region", "Never aggregate sales.csv", "Do not limit sales.csv"):
         assert router.analyze(discussion, []).tool_use is False
+    for discussion in ("Explain how to roll a six-sided die fairly.", "Explain why rolling dice is useful in games."):
+        assert router.analyze(discussion, []).tool_use is not True
     for discussion in ("What files are in a typical Python package?", "Which directories are in the Unix filesystem hierarchy?", "List common files in a Python package", "Show the files normally found in a web project"):
         decision = router.analyze(discussion, [])
         assert decision.tool_use is False and decision.document_read is False
@@ -293,6 +302,39 @@ def test_routing_tool_flags_semantic_repair_and_mixed():
     assert classifier.classify("Handle this utility request", []).tool_use is True
     broken = IntentClassifier(lambda messages, **kwargs: "bad", logger=lambda _: None)
     assert broken.classify("Handle this", []).tool_use is False
+
+
+def test_current_weather_phrasing_routes_tools_without_capturing_conceptual_questions():
+    router = DeterministicIntentRouter()
+
+    for request in (
+        "What is the weather like in New Delhi?",
+        "What is the weather today in Mumbai?",
+        "Is it raining in London right now?",
+        "Is it raining in Mumbai?",
+        "Will it rain in Mumbai today?",
+        "What's the chance of rain in Mumbai today?",
+        "What is the chance of rain today in Pune?",
+        "What is the precipitation probability in London today?",
+        "What are the current conditions in Hyderabad?",
+        "What are the weather conditions in Paris?",
+        "What is New Delhi's current temperature?",
+        "How hot is it in Singapore right now?",
+    ):
+        decision = router.analyze(request, [])
+        assert decision.tool_use is True and decision.complete
+        assert decision.source_for("tool_use") == "deterministic"
+
+    for discussion in (
+        "Explain what a weather API is.",
+        "What causes weather?",
+        "Why does it rain?",
+        "How do weather forecasts work?",
+        "What is precipitation probability?",
+    ):
+        decision = router.analyze(discussion, [])
+        assert decision.tool_use is False
+        assert decision.source_for("tool_use") == "deterministic"
 
 
 def test_tool_log_sanitizer_redacts_and_bounds():
@@ -321,7 +363,7 @@ class FakeMemory:
     last_retrieval_stats = {"facts": []}
 
 class QueueOrchestrator(ConversationOrchestrator):
-    def __init__(self, outputs, **kwargs): self.outputs=list(outputs); self.inputs=[]; self.overrides=[]; super().__init__(FakeTokenizer(), object(), FakeMemory(), logger=lambda _: None, **kwargs)
+    def __init__(self, outputs, **kwargs): self.outputs=list(outputs); self.inputs=[]; self.overrides=[]; super().__init__(FakeTokenizer(), object(), FakeMemory(), logger=kwargs.pop("logger", lambda _: None), **kwargs)
     def generate_reply(self, messages, **overrides):
         self.inputs.append([dict(m) for m in messages]); self.overrides.append(overrides)
         return self.outputs.pop(0)
@@ -347,6 +389,46 @@ def test_multi_tool_loop_budget_and_ephemeral_history():
     assert "tool-call limit" in reply and "<tool_call>" not in reply
 
 
+def test_tool_generation_rejects_no_call_completion_after_one_bounded_correction():
+    logs = []
+    orchestrator = QueueOrchestrator(["A normal answer.", "Still no tool call."], logger=logs.append)
+
+    reply = orchestrator.generate_tool_aware_reply(
+        [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}, {"role": "user", "content": "Calculate 2+2."}],
+        turn_number=7,
+    )
+
+    assert "no valid registered tool execution" in reply
+    assert len(orchestrator.inputs) == 2
+    assert "normal assistant answer cannot complete" in orchestrator.inputs[1][-1]["content"].lower()
+    assert any(
+        "[Tool Generation] round=1 schemas=9" in message
+        and "calculator" in message
+        and "fetch_webpage" not in message
+        for message in logs
+    )
+    assert any("[Tool Generation] round=1 parsed_calls=0 outcome=no_tool_call" in message for message in logs)
+    assert any("[Tool Enforcement] Rejected normal response" in message for message in logs)
+
+
+def test_explicitly_requested_tool_must_succeed_before_normal_completion():
+    roll = '<tool_call>{"name":"roll_die","arguments":{"sides":6}}</tool_call>'
+    calculate = '<tool_call>{"name":"calculator","arguments":{"expression":"4 + 3"}}</tool_call>'
+    orchestrator = QueueOrchestrator([roll, "The total is 7.", calculate, "The roll was 4 and the total is 7."])
+
+    with patch("tools.random_tools.random.randint", return_value=4):
+        _, reply, _, _ = orchestrator.process_turn(
+            "Roll a die, then use the calculator tool to add 4 and 3.",
+            [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}],
+            turn_number=1,
+        )
+
+    assert reply == "The roll was 4 and the total is 7."
+    assert [result.call.name for result in orchestrator.last_tool_executions] == ["roll_die", "calculator"]
+    assert all(result.ok for result in orchestrator.last_tool_executions)
+    assert "calculator" in orchestrator.inputs[2][-1]["content"]
+
+
 def test_multiple_calls_in_one_model_message_execute_in_order():
     combined = ('<tool_call>{"name":"calculator","arguments":{"expression":"3+4"}}</tool_call>'
                 '<tool_call>{"name":"calculator","arguments":{"expression":"5+6"}}</tool_call>')
@@ -354,6 +436,29 @@ def test_multiple_calls_in_one_model_message_execute_in_order():
     _, reply, _, _ = orchestrator.process_turn("Calculate 3+4 and 5+6", [{"role":"system","content":DEFAULT_SYSTEM_PROMPT}], turn_number=1)
     assert reply == "results ready"
     assert [result.data["value"] for result in orchestrator.last_tool_executions] == [7, 11]
+
+
+def test_dependent_calculation_uses_actual_prior_die_results():
+    outputs = [
+        '<tool_call>{"name":"roll_die","arguments":{"sides":6}}</tool_call>',
+        '<tool_call>{"name":"roll_die","arguments":{"sides":6}}</tool_call>',
+        '<tool_call>{"name":"calculator","arguments":{"expression":"2 + 5"}}</tool_call>',
+        "The rolls were 2 and 5, totaling 7.",
+    ]
+    orchestrator = QueueOrchestrator(outputs)
+
+    with patch("tools.random_tools.random.randint", side_effect=[2, 5]):
+        _, reply, _, _ = orchestrator.process_turn(
+            "Roll a six-sided die twice, then use the calculator tool to add the two actual returned rolls.",
+            [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}],
+            turn_number=1,
+        )
+
+    assert reply == "The rolls were 2 and 5, totaling 7."
+    assert [result.call.name for result in orchestrator.last_tool_executions] == ["roll_die", "roll_die", "calculator"]
+    assert [result.data["value"] for result in orchestrator.last_tool_executions] == [2, 5, 7]
+    final_tool_payloads = [json.loads(message["content"]) for message in orchestrator.inputs[-1] if message["role"] == "tool"]
+    assert [payload["data"]["value"] for payload in final_tool_payloads] == [2, 5, 7]
 
 
 def test_tool_call_ids_are_unique_and_malformed_calls_can_recover():
@@ -366,10 +471,12 @@ def test_tool_call_ids_are_unique_and_malformed_calls_can_recover():
     assistant_ids = [message["tool_calls"][0]["id"] for message in orchestrator.inputs[-1] if message["role"] == "assistant" and message.get("tool_calls")]
     assert tool_ids == assistant_ids == ["tool_call_2", "tool_call_2_2"]
 
-    malformed = QueueOrchestrator(['<tool_call>{"name":"calculator"', "recovered"])
+    valid = '<tool_call>{"name":"calculator","arguments":{"expression":"2+2"}}</tool_call>'
+    malformed = QueueOrchestrator(['<tool_call>{"name":"calculator"', "not recovered", valid, "recovered"])
     _, reply, _, _ = malformed.process_turn("Calculate this", [{"role":"system","content":DEFAULT_SYSTEM_PROMPT}], turn_number=1)
-    assert reply == "recovered" and len(malformed.last_tool_executions) == 1
+    assert reply == "recovered" and len(malformed.last_tool_executions) == 2
     assert malformed.last_tool_executions[0].error_details["code"] == "unknown_tool"
+    assert malformed.last_tool_executions[1].ok and malformed.last_tool_executions[1].data["value"] == 4
 
 
 def test_tool_payload_context_serialization_stays_valid_and_bounded():
@@ -386,7 +493,7 @@ def test_cumulative_tool_arguments_and_results_stay_within_context_budget():
     orchestrator = QueueOrchestrator([call] * 8 + ["budget answer"])
     with patch("orchestrator.MAX_TOOL_CALLS_PER_TURN", 8), patch("orchestrator.MAX_TOOL_CONTEXT_CHARS", 2_000):
         _, reply, _, _ = orchestrator.process_turn("Calculate these values", [{"role":"system","content":DEFAULT_SYSTEM_PROMPT}], turn_number=1)
-    assert reply == "budget answer"
+    assert "tool-call limit" in reply
     tool_messages = [message for message in orchestrator.inputs[-1] if message["role"] == "tool"]
     assistant_calls = [message["tool_calls"][0] for message in orchestrator.inputs[-1] if message["role"] == "assistant" and message.get("tool_calls")]
     context_chars = sum(len(message["content"]) for message in tool_messages)

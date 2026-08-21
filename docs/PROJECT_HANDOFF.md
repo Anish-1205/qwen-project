@@ -1,6 +1,6 @@
 # Project Context Handoff — Qwen Local Chatbot
 
-**Last verified:** 2026-08-20 against the live workspace.
+**Last verified:** 2026-08-22 against the live workspace.
 
 **Canonical detailed audit:** `docs/PROJECT_AUDIT_FULL.md`
 
@@ -68,7 +68,10 @@ Intent, memory, documents, tools, and session history are intentionally separate
 
 Production tool calling lives in `tools/` and `orchestrator.py`.
 
-The registry includes die/random utilities, safe expression/list aggregation, bounded web text fetching, Open-Meteo weather, one-off local file reading, declarative CSV/XLSX analysis, and bounded directory listing.
+The registry includes die/random utilities, safe expression/list aggregation,
+Frankfurter daily currency reference rates/conversion, structured Tavily web
+search, bounded web text fetching, Open-Meteo weather, one-off local file
+reading, declarative CSV/XLSX analysis, and bounded directory listing.
 
 Important behavior:
 
@@ -79,9 +82,16 @@ Important behavior:
 - Calls execute sequentially, including repeated tools; exhaustion forces a final tools-disabled answer.
 - Tool call/result messages are temporary for the follow-up generation; only the final answer enters normal chat history.
 - Tools are stateless and never write to memory, document, or session databases.
+- Tool logs record schema exposure, generation round, parsed-call count, validation/execution results, and budget exhaustion without adding raw model output.
+- Tavily web search reads `TAVILY_API_KEY` only inside the tool. Missing
+  credentials fail explicitly; search results cannot be replaced by
+  `fetch_webpage` or model-authored prose.
 - The old experiment still uses `eval()` but is isolated under `experiments/`.
 
-Verification: the automated suite covers all eight registered tools, malformed/duplicate tool-call handling, bounded multi-call orchestration, and the three-spreadsheet pipeline. A current live-Qwen regression over every tool is still desirable.
+Verification: the automated suite covers all ten registered tools,
+malformed/duplicate tool-call handling, bounded multi-call orchestration, and
+the three-spreadsheet pipeline. A current live-Qwen regression over every tool
+is still desirable.
 
 ## 5. Memory
 
@@ -166,7 +176,10 @@ Last command run:
 .\qwen-env\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-Results on 2026-08-20: **95 pytest tests passed (plus 51 subtests)** and **61/61 unittest tests passed**.
+Results on 2026-08-22 after structured Tavily web search was added:
+**141 pytest tests passed (plus 57 subtests)**. The last unittest discovery run
+before this phase remained **61/61**; pytest is the canonical full suite and was
+run once for this phase.
 
 Covered:
 
@@ -175,6 +188,11 @@ Covered:
 - Prompt conditioning, compression rules, and document-budget trimming.
 - Filename-scoped RAG and missing-file decoy prevention.
 - Tool schemas, parsing, validation, safe calculator, execution, failure responses, and orchestration.
+- Frankfurter daily reference-rate lookup/conversion, provider failures,
+  response bounds, currency routing, and result grounding.
+- Tavily search success/failures, credential isolation, response/result bounds,
+  search routing, required execution, and rejection of fabricated/scraper
+  fallback completion.
 
 Still missing or not rerun for this revision:
 
@@ -227,6 +245,6 @@ Still missing or not rerun for this revision:
 - Add tools only through the registry plus centralized validation and tests.
 - Do not use the experiment’s `eval()` calculator in production.
 - Do not describe tool calling as experimental-only; the current production orchestrator uses it.
-- Do not claim there are no automated tests; the current discoverable suite has 59.
+- Do not claim there are no automated tests; the current suite has 141 pytest tests (plus 57 subtests), and the last unittest discovery run had 61 tests.
 - `chat.py` is canonical unless the user says otherwise.
 - Do not create commits unless explicitly requested.

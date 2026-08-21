@@ -25,6 +25,8 @@ warnings.filterwarnings("ignore", message="triton not found")
 from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from huggingface_hub.utils import logging as hf_logging
+from markdown_it import MarkdownIt
+import nh3
 from pydantic import BaseModel, Field
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -43,6 +45,14 @@ SESSION_COOKIE = "roots_chat_session"
 APP_TITLE = "Roots Chat"
 DEFAULT_SESSION_TITLE = "New Chat"
 SESSION_TITLE_MAX_LENGTH = 48
+
+MARKDOWN_RENDERER = MarkdownIt("commonmark", {"html": False, "linkify": False, "typographer": False})
+MARKDOWN_ALLOWED_TAGS = {
+  "a", "blockquote", "br", "code", "del", "em", "h1", "h2", "h3", "h4", "h5", "h6",
+  "hr", "li", "ol", "p", "pre", "strong", "ul",
+}
+MARKDOWN_ALLOWED_ATTRIBUTES = {"a": {"href", "title"}, "code": {"class"}}
+MARKDOWN_ALLOWED_URL_SCHEMES = {"http", "https", "mailto"}
 
 
 class ChatRequest(BaseModel):
@@ -166,6 +176,26 @@ def _message_row_to_dict(row: sqlite3.Row) -> dict:
         "turn_number": row["turn_number"],
         "created_at": row["created_at"],
     }
+
+
+def _render_assistant_markdown(content: str) -> str:
+  """Render trusted Markdown syntax while keeping embedded HTML and unsafe URLs inert."""
+  rendered = MARKDOWN_RENDERER.render(content or "")
+  return nh3.clean(
+    rendered,
+    tags=MARKDOWN_ALLOWED_TAGS,
+    attributes=MARKDOWN_ALLOWED_ATTRIBUTES,
+    url_schemes=MARKDOWN_ALLOWED_URL_SCHEMES,
+    link_rel="noopener noreferrer",
+    strip_comments=True,
+  )
+
+
+def _message_to_response(message: dict) -> dict:
+  response_message = dict(message)
+  if response_message.get("role") == "assistant":
+    response_message["rendered_content"] = _render_assistant_markdown(response_message.get("content", ""))
+  return response_message
 
 
 def _create_session_record(title: str = DEFAULT_SESSION_TITLE, session_id: str | None = None) -> dict:
@@ -401,7 +431,7 @@ def _session_payload(session_id: str) -> dict:
     raise HTTPException(status_code=404, detail="Session not found")
   return {
     "session": session_record,
-    "messages": _get_session_messages(session_id),
+    "messages": [_message_to_response(message) for message in _get_session_messages(session_id)],
   }
 
 
@@ -1159,10 +1189,108 @@ def _format_trace_html(initial_session_id: str) -> str:
     }
 
     .content {
-      white-space: pre-wrap;
-      word-break: break-word;
       line-height: 1.65;
       font-size: 1rem;
+      min-width: 0;
+      text-align: left;
+      overflow-wrap: break-word;
+    }
+
+    .message.user .content,
+    .message.system .content {
+      white-space: pre-wrap;
+    }
+
+    .message.assistant .content > :first-child { margin-top: 0; }
+    .message.assistant .content > :last-child { margin-bottom: 0; }
+
+    .message.assistant .content p {
+      margin: 0 0 0.9em;
+    }
+
+    .message.assistant .content h1,
+    .message.assistant .content h2,
+    .message.assistant .content h3,
+    .message.assistant .content h4,
+    .message.assistant .content h5,
+    .message.assistant .content h6 {
+      margin: 1.25em 0 0.55em;
+      color: var(--text);
+      font-weight: 700;
+      line-height: 1.25;
+      letter-spacing: -0.02em;
+    }
+
+    .message.assistant .content h1 { font-size: 1.45rem; }
+    .message.assistant .content h2 { font-size: 1.28rem; }
+    .message.assistant .content h3 { font-size: 1.14rem; }
+    .message.assistant .content h4,
+    .message.assistant .content h5,
+    .message.assistant .content h6 { font-size: 1rem; }
+
+    .message.assistant .content ul,
+    .message.assistant .content ol {
+      margin: 0.55em 0 0.95em;
+      padding-left: 1.55em;
+    }
+
+    .message.assistant .content li {
+      margin: 0.28em 0;
+      padding-left: 0.15em;
+    }
+
+    .message.assistant .content li > ul,
+    .message.assistant .content li > ol {
+      margin: 0.25em 0;
+    }
+
+    .message.assistant .content strong { font-weight: 700; color: var(--text); }
+
+    .message.assistant .content a {
+      color: var(--accent-3);
+      text-decoration: underline;
+      text-decoration-thickness: 0.08em;
+      text-underline-offset: 0.16em;
+      overflow-wrap: anywhere;
+    }
+
+    .message.assistant .content code {
+      padding: 0.12em 0.35em;
+      border-radius: 6px;
+      background: rgba(0, 0, 0, 0.28);
+      font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+      font-size: 0.9em;
+    }
+
+    .message.assistant .content pre {
+      max-width: 100%;
+      margin: 0.75em 0 1em;
+      padding: 14px 16px;
+      overflow-x: auto;
+      border: 1px solid rgba(255,255,255,0.09);
+      border-radius: var(--radius-md);
+      background: rgba(3, 7, 14, 0.72);
+      line-height: 1.5;
+    }
+
+    .message.assistant .content pre code {
+      padding: 0;
+      background: transparent;
+      white-space: pre;
+      overflow-wrap: normal;
+    }
+
+    .message.assistant .content blockquote {
+      margin: 0.75em 0 1em;
+      padding: 0.15em 0 0.15em 1em;
+      border-left: 3px solid rgba(125, 227, 208, 0.45);
+      color: var(--muted);
+    }
+
+    .message.assistant .content hr {
+      margin: 1.2em 0;
+      border: 0;
+      border-top: 1px solid rgba(255,255,255,0.12);
     }
 
     .composer {
@@ -1605,10 +1733,17 @@ def _format_trace_html(initial_session_id: str) -> str:
       const shouldScroll = options.shouldScroll ?? autoScrollPinned;
       const item = document.createElement('article');
       item.className = `message ${role}`;
-      item.innerHTML = `
-        <div class="role">${role}</div>
-        <div class="content">${escapeHtml(content)}</div>
-      `;
+      const roleLabel = document.createElement('div');
+      roleLabel.className = 'role';
+      roleLabel.textContent = role;
+      const messageContent = document.createElement('div');
+      messageContent.className = 'content';
+      if (role === 'assistant' && options.renderedContent != null) {
+        messageContent.innerHTML = options.renderedContent;
+      } else {
+        messageContent.textContent = content;
+      }
+      item.append(roleLabel, messageContent);
       messages.appendChild(item);
       if (shouldScroll) scrollToLatest();
       return item;
@@ -1623,7 +1758,10 @@ def _format_trace_html(initial_session_id: str) -> str:
         return;
       }
       for (const message of messageList) {
-        appendMessage(message.role, message.content, { shouldScroll: false });
+        appendMessage(message.role, message.content, {
+          shouldScroll: false,
+          renderedContent: message.rendered_content,
+        });
       }
       if (shouldScroll) scrollToLatest();
     }
@@ -1956,10 +2094,13 @@ def _format_trace_html(initial_session_id: str) -> str:
           throw new Error(payload.detail || payload.error || 'Request failed');
         }
 
-        pending.querySelector('.content').textContent = payload.reply || '';
+        pending.querySelector('.content').innerHTML = payload.rendered_content || '';
         pending.querySelector('.role').textContent = 'assistant';
         activeSessionId = payload.session_id || activeSessionId;
-        currentMessages.push({ role: 'user', content: message }, { role: 'assistant', content: payload.reply || '' });
+        currentMessages.push(
+          { role: 'user', content: message },
+          { role: 'assistant', content: payload.reply || '', rendered_content: payload.rendered_content || '' },
+        );
         sessionIdLabel.textContent = `${payload.session?.title || 'Chat'} · ${activeSessionId.slice(0, 8)}`;
         syncSessionRow(payload.session || { id: activeSessionId, title: payload.session?.title || 'Chat', updated_at: new Date().toISOString() }, true);
         renderTrace(payload);
@@ -2239,6 +2380,7 @@ def _process_turn(session_id: str, session_state: SessionState, message: str) ->
           "session": _get_session_record(session_id),
             "turn_number": turn_number,
             "reply": reply,
+            "rendered_content": _render_assistant_markdown(reply),
             "memory_context": memory_context,
             "document_result": _serialize_document_result(document_result),
             "retrieval_metadata": _serialize_retrieval_metadata(retrieval_metadata),

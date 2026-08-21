@@ -4,6 +4,8 @@ bitsandbytes
 colorama
 fastapi
 huggingface-hub
+markdown-it-py==4.0.0
+nh3==0.3.2
 numpy
 openpyxl
 pydantic

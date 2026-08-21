@@ -10,6 +10,7 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Callable, Sequence
+from urllib.parse import urlsplit, urlunsplit
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,10 +122,61 @@ class DeterministicIntentRouter:
     )
     _TOOL_ACTION = re.compile(r"\b(?:fetch|open|read|extract|inspect|parse|load|scrape|check|analy[sz]e|summari[sz]e|list|show|find|select|filter|group|aggregate|sort|limit|total|sum|mean|average|count|calculate|compute|compare|roll|pick|generate|give|get)\b", re.I)
     _URL = re.compile(r"https?://[^\s<>]+", re.I)
+    _WEBPAGE_ACTION = re.compile(
+        r"\b(?:fetch|open|read|extract|inspect|parse|load|scrape|check|analy[sz]e|summari[sz]e|compare)\b",
+        re.I,
+    )
     _WEATHER_REQUEST = re.compile(
-        r"\b(?:current\s+weather|weather\s+(?:in|at|for)|forecast\s+(?:in|at|for)|temperature\s+(?:in|at|for)|[\w'-]+'s\s+temperature)\b"
+        r"\b(?:current\s+weather"
+        r"|weather(?:\s+(?:be\s+)?like)?(?:\s+(?:today|now|right\s+now|currently|tomorrow))?\s+(?:in|at|for)"
+        r"|forecast\s+(?:in|at|for)"
+        r"|(?:current\s+)?temperature(?:\s+(?:today|now|right\s+now|currently))?\s+(?:in|at|for)"
+        r"|(?:[\w'-]+\s+){0,4}[\w'-]+'s\s+(?:current\s+)?temperature"
+        r"|(?:current\s+(?:weather\s+)?conditions|weather\s+conditions)"
+        r"(?:\s+(?:today|now|right\s+now|currently))?\s+(?:in|at|for)"
+        r"|conditions\s+(?:today|now|right\s+now|currently)\s+(?:in|at|for)"
+        r"|(?:chance|probability)\s+of\s+(?:rain|snow|precipitation)"
+        r"(?:\s+(?:today|tomorrow|now|right\s+now|currently))?\s+(?:in|at|for)"
+        r"|precipitation\s+probability(?:\s+(?:today|tomorrow|now|right\s+now|currently))?\s+(?:in|at|for))\b"
         r"|^\s*(?:weather|forecast)\s+(?!apis?\b|forecasting\b)(?:for\s+)?[\w .'-]+[?.!]*$"
-        r"|\bwill\s+[\w .'-]+\s+(?:get|have)\s+(?:rain|snow)\b",
+        r"|\bwill\s+[\w .'-]+\s+(?:get|have)\s+(?:rain|snow)\b"
+        r"|\b(?:is|will)\s+it\s+(?:rain(?:ing)?|snow(?:ing)?)\s+(?:in|at)\b"
+        r"|\bhow\s+(?:hot|cold|warm|cool)\s+is\s+it\s+(?:in|at)\b"
+        r"|\b(?:is|are)\s+there\s+(?:any\s+)?(?:rain|snow|precipitation)\s+(?:in|at)\b",
+        re.I,
+    )
+    _CURRENCY_EXCHANGE_REQUEST = re.compile(
+        r"\b(?:convert|exchange)\b[^?.!]{0,120}\b(?:to|into|for)\b"
+        r"|\b(?:current|latest|today(?:'s)?)\s+(?:(?:foreign|currency)\s+)?exchange\s+rates?\b"
+        r"|\b(?:exchange|conversion)\s+rates?\b[^?.!]{0,100}\b(?:for|from|between)\b"
+        r"|\bhow\s+much\s+(?:is|are|would)\b[^?.!]{0,100}\d[^?.!]{0,100}\b(?:in|into)\b",
+        re.I,
+    )
+    _CURRENCY_EXCHANGE_DISCUSSION = re.compile(
+        r"^\s*(?:(?:what\s+(?:is|are)|define|explain)\s+(?:an?\s+|the\s+concept\s+of\s+)?"
+        r"(?:(?:foreign|currency)\s+)?exchange\s+rates?"
+        r"|(?:what\s+is|define|explain)\s+(?:the\s+concept\s+of\s+)?currency\s+conversion)\s*[?.!]*$"
+        r"|^\s*(?:how|why)\s+do(?:es)?\b[^?.!]{0,100}\bexchange\s+rates?\b"
+        r"[^?.!]{0,80}\b(?:work|change|fluctuate|vary)\b"
+        r"|^\s*how\s+(?:do|can|could|should|would)\s+(?:i|we)\s+convert\b",
+        re.I,
+    )
+    _WEB_SEARCH_REQUEST = re.compile(
+        r"\bsearch\s+(?:the\s+)?(?:web|internet|online)\s+(?:for|about)\b"
+        r"|\b(?:web|internet)\s+search\s+(?:for|about)\b"
+        r"|\bfind\b[^?.!]{0,80}\b(?:information|sources?|results?)\b[^?.!]{0,60}"
+        r"\b(?:online|on\s+the\s+(?:web|internet))\b"
+        r"|\bfind\b[^?.!]{0,80}\b(?:online|on\s+the\s+(?:web|internet))\b"
+        r"|\blook\s+up\s+(?:the\s+)?(?:latest|current|recent|today(?:'s)?)\b"
+        r"|\blook\s+(?:it|this|that)\s+up\s+(?:online|on\s+the\s+(?:web|internet))\b",
+        re.I,
+    )
+    _WEB_SEARCH_DISCUSSION = re.compile(
+        r"^\s*(?:(?:what\s+is|define|explain)\s+(?:an?\s+|the\s+concept\s+of\s+)?"
+        r"(?:web|internet|online)\s+search"
+        r"|why\s+is\s+(?:web|internet|online)\s+search\s+useful)\s*[?.!]*$"
+        r"|^\s*how\s+(?:do|can|could|should|would)\s+(?:i|we)\s+search\s+"
+        r"(?:the\s+)?(?:web|internet|online)\b",
         re.I,
     )
     _DIRECTORY_REQUEST = re.compile(
@@ -150,14 +202,23 @@ class DeterministicIntentRouter:
         r"|\bwhat(?:\s+is|'s)\s+(?:the\s+)?(?:sum|mean|average|minimum|maximum|count)\s+of\b)",
         re.I,
     )
-    _RANDOM_REQUEST = re.compile(r"\b(?:roll\s+(?:a|the)?\s*d(?:ie|ice)|random\s+(?:number|integer)|pick\s+(?:a\s+)?number\s+between)\b", re.I)
+    _RANDOM_REQUEST = re.compile(
+        r"(?:^\s*(?:please\s+)?roll\b[^?.!]{0,80}\bd(?:ie|ice)\b"
+        r"|^\s*(?:can|could|would|will)\s+you\s+roll\b[^?.!]{0,80}\bd(?:ie|ice)\b"
+        r"|\brandom\s+(?:number|integer)\b"
+        r"|\bpick\s+(?:a\s+)?number\s+between\b)",
+        re.I,
+    )
     _NEGATED_TOOL_REQUEST = re.compile(
         r"^\s*(?:please\s+)?(?:do\s+not|don't|never)\s+"
-        r"(?:fetch|open|read|extract|inspect|parse|load|scrape|check|analy[sz]e|summari[sz]e|list|show|find|select|filter|group|aggregate|sort|limit|total|sum|mean|average|count|calculate|compute|compare|roll|pick|generate|get)\b",
+        r"(?:fetch|search|look\s+up|open|read|extract|inspect|parse|load|scrape|check|analy[sz]e|summari[sz]e|list|show|find|select|filter|group|aggregate|sort|limit|total|sum|mean|average|count|calculate|compute|compare|roll|pick|generate|get)\b",
         re.I,
     )
     _TOOL_DISCUSSION = re.compile(
         r"^\s*how\s+(?:do|does|would)\b[^?.!]{0,120}\bwork\b"
+        r"|^\s*why\s+(?:does|do)\s+it\s+(?:rain|snow)\b"
+        r"|^\s*what\s+(?:is|are)\s+(?:the\s+)?(?:precipitation\s+probability|chance\s+of\s+(?:rain|snow))\s*[?.!]*$"
+        r"|^\s*what\s+(?:is|are)\s+(?:an?\s+|the\s+)?spreadsheet(?:s)?\b"
         r"|^\s*how\s+(?:do|can|could|should|would)\s+(?:i|we)\b[^?.!]{0,80}\b(?:fetch|open|read|extract|inspect|parse|load|scrape|list|select|filter|group|aggregate|sort|limit|calculate)\b"
         r"|^\s*(?:show|tell|teach|explain)\s+(?:me\s+)?how\b[^?.!]{0,120}\bwork\b"
         r"|^\s*(?:can|could|would)\s+you\s+(?:explain|show|tell|teach)\b[^?.!]{0,80}\bhow\b[^?.!]{0,80}\b(?:fetch|open|read|extract|inspect|parse|load|scrape|list|select|filter|group|aggregate|sort|limit|calculate)\b"
@@ -316,6 +377,55 @@ class DeterministicIntentRouter:
             return tuple(dict.fromkeys(routes))
         return ()
 
+    @classmethod
+    def is_web_search_request(cls, text: str) -> bool:
+        """Identify explicit web-search actions for routing and completion enforcement."""
+        normalized = re.sub(r"\s+", " ", (text or "").strip())
+        return bool(
+            cls._WEB_SEARCH_REQUEST.search(normalized)
+            and not cls._WEB_SEARCH_DISCUSSION.search(normalized)
+            and not cls._NEGATED_TOOL_REQUEST.search(normalized)
+        )
+
+    @staticmethod
+    def normalize_current_turn_url(value: str) -> str | None:
+        """Conservatively normalize an explicit URL for current-turn authorization."""
+        if not isinstance(value, str):
+            return None
+        candidate = value.strip().strip("\"'").rstrip(".,;:!?")
+        pairs = {")": "(", "]": "[", "}": "{"}
+        while candidate and candidate[-1] in pairs:
+            closer = candidate[-1]
+            if candidate.count(closer) <= candidate.count(pairs[closer]):
+                break
+            candidate = candidate[:-1]
+        try:
+            parsed = urlsplit(candidate)
+            if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+                return None
+            parsed.port
+        except (TypeError, ValueError):
+            return None
+        return urlunsplit(
+            (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or "/", parsed.query, "")
+        )
+
+    @classmethod
+    def current_turn_webpage_urls(cls, text: str) -> tuple[str, ...]:
+        """Return only URLs explicitly authorized for page reading in this user turn."""
+        normalized = re.sub(r"\s+", " ", (text or "").strip())
+        if (
+            not cls._WEBPAGE_ACTION.search(normalized)
+            or cls._NEGATED_TOOL_REQUEST.search(normalized)
+        ):
+            return ()
+        urls: list[str] = []
+        for match in cls._URL.finditer(normalized):
+            url = cls.normalize_current_turn_url(match.group(0))
+            if url and url not in urls:
+                urls.append(url)
+        return tuple(urls)
+
     def analyze(self, user_input: str, recent_messages: Sequence[dict]) -> DeterministicIntentEvidence:
         text = re.sub(r"\s+", " ", (user_input or "").strip())
         asserted = self.asserted_memory_relations(text)
@@ -338,8 +448,10 @@ class DeterministicIntentRouter:
         directory_discussion = bool(self._DIRECTORY_DISCUSSION.search(text) and not local_directory_target)
         spreadsheet_request = bool(self._SPREADSHEET_REQUEST.search(text))
         tool_request = bool(
-            (self._URL.search(text) and self._TOOL_ACTION.search(text))
+            self.current_turn_webpage_urls(text)
             or self._WEATHER_REQUEST.search(text)
+            or self._CURRENCY_EXCHANGE_REQUEST.search(text)
+            or self.is_web_search_request(text)
             or (explicit_local_path and self._TOOL_ACTION.search(text))
             or directory_request
             or spreadsheet_request
@@ -349,6 +461,8 @@ class DeterministicIntentRouter:
         negated_or_discussion = bool(
             self._NEGATED_TOOL_REQUEST.search(text)
             or self._TOOL_DISCUSSION.search(text)
+            or self._CURRENCY_EXCHANGE_DISCUSSION.search(text)
+            or self._WEB_SEARCH_DISCUSSION.search(text)
             or directory_discussion
         )
         if negated_or_discussion:
@@ -541,7 +655,7 @@ class IntentClassifier:
                     "follow-up to a file discussion. Organization-specific facts such as internal rules, employee benefits, "
                     "employer-provided resources, procedures, and responsible internal contacts also require document_read "
                     "even when no file is named; generic questions about companies do not. Words such as 'knowledge' or 'update' alone do not imply documents. "
-                    "tool_use means the assistant must execute a registered utility: fetch a URL, get current weather, read/list a local path, analyze a spreadsheet, calculate arithmetic, or produce a die/random result. Discussion about those topics is not tool use. "
+                    "tool_use means the assistant must execute a registered utility: search the web, fetch a user-supplied URL, get current weather or exchange-rate data, read/list a local path, analyze a spreadsheet, calculate arithmetic, or produce a die/random result. Discussion about those topics is not tool use. "
                     "general_chat means some part can be answered from ordinary conversation or model knowledge. Use recent "
                     "context only to resolve references. Examples: capital question => only general_chat; 'what is my name?' or "
                     "'where do I live?' or 'what is my favorite language?' => only memory_read; 'I moved to Pune', 'I live in Hyderabad now', "

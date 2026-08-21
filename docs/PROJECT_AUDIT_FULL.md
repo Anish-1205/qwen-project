@@ -1,5 +1,11 @@
 # Qwen Local Chatbot — Current Repository Audit
 
+> Historical snapshot: this audit is dated 2026-08-20. Its production-tool
+> inventory, orchestration limits, test counts, and dependency findings were
+> superseded by later repository changes. Use `PROJECT_HANDOFF.md` for the
+> current architecture and `PROJECT_ISSUES.md` for current status and regression
+> history.
+
 **Audit date:** 2026-08-20
 
 **Repository state:** live workspace, initialized as a Git repository after the audit

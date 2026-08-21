@@ -28,6 +28,7 @@ class ToolExecutionResult:
     data: dict[str, Any] | None = None
     error_details: dict[str, Any] | None = None
     meta: dict[str, Any] | None = None
+    validated_arguments: dict[str, Any] | None = None
     @property
     def result(self):
         if self.data and "value" in self.data: return self.data["value"]
@@ -41,6 +42,9 @@ class ToolExecutionResult:
 class ToolManager:
     def __init__(self, registry: ToolRegistry | None = None) -> None: self.registry = registry or build_default_registry()
     def schemas(self) -> list[dict[str, Any]]: return self.registry.schemas()
+    def provenance(self, tool_name: str) -> str:
+        definition = self.registry.get(tool_name)
+        return definition.provenance if definition is not None else "unknown"
     @staticmethod
     def _strict_json_loads(value: str) -> Any:
         def reject_constant(constant: str):
@@ -96,16 +100,27 @@ class ToolManager:
             if not isinstance(data, dict): data = {"value": data}
             data = self._json_safe(data)
             data = self._bound_data(data)
-            return ToolExecutionResult(call, True, data=data, meta={})
+            return ToolExecutionResult(call, True, data=data, meta={}, validated_arguments=arguments)
         except ToolValidationError as exc: return self._failure(call, "validation_error", str(exc))
-        except ToolError as exc: return self._failure(call, exc.code, exc.message, exc.details)
-        except (ValueError, TypeError, OSError) as exc: return self._failure(call, "execution_error", str(exc)[:500])
+        except ToolError as exc: return self._failure(call, exc.code, exc.message, exc.details, arguments)
+        except (ValueError, TypeError, OSError) as exc: return self._failure(call, "execution_error", str(exc)[:500], validated_arguments=arguments)
         except Exception:
             LOG.exception("Unexpected tool failure for %s", call.name)
-            return self._failure(call, "internal_error", "The tool failed unexpectedly.")
+            return self._failure(call, "internal_error", "The tool failed unexpectedly.", validated_arguments=arguments)
     @staticmethod
-    def _failure(call: ToolCall, code: str, message: str, details: dict | None = None) -> ToolExecutionResult:
-        return ToolExecutionResult(call, False, error_details={"code": code, "message": message, "details": details or {}})
+    def _failure(
+        call: ToolCall,
+        code: str,
+        message: str,
+        details: dict | None = None,
+        validated_arguments: dict[str, Any] | None = None,
+    ) -> ToolExecutionResult:
+        return ToolExecutionResult(
+            call,
+            False,
+            error_details={"code": code, "message": message, "details": details or {}},
+            validated_arguments=validated_arguments,
+        )
     @staticmethod
     def _normalize_arguments(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         output = dict(arguments)
