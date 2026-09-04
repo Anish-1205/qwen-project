@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from orchestrator import DocumentRetrievalResult
+from harness import DocumentRetrievalResult
 
 from .chunking import chunk_segments
 from .config import (

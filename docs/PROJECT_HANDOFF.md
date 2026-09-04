@@ -1,8 +1,8 @@
-# Project Context Handoff — Qwen Local Chatbot
+# Project Context Handoff — Model-Agnostic Local AI Harness
 
-**Last verified:** 2026-08-22 against the live workspace.
+**Last verified:** 2026-09-04 against the live workspace.
 
-**Canonical detailed audit:** `docs/PROJECT_AUDIT_FULL.md`
+**Historical detailed audit:** `docs/PROJECT_AUDIT_FULL.md`
 
 ## How to work with me
 
@@ -16,8 +16,8 @@
 
 ## 1. What the project is
 
-- Local, single-user assistant built around `Qwen/Qwen2.5-3B-Instruct` in 4-bit NF4.
-- Shared `ConversationOrchestrator` used by:
+- Local, single-user AI harness whose default backend loads `Qwen/Qwen2.5-3B-Instruct` in 4-bit NF4.
+- Shared `HarnessRunner` used by:
   - `chat.py` — canonical CLI with history and compression.
   - `infer.py` — stateless alternate CLI.
   - `webapp.py` — FastAPI UI with persistent chat sessions and document management.
@@ -35,12 +35,13 @@
 chat.py / infer.py / webapp.py
               │
               ▼
-   ConversationOrchestrator
+        HarnessRunner
       ├── hybrid intent router
       ├── OfflineMemoryManager ──► data/agent_memory.db
       ├── DocumentIndex ─────────► data/documents.db + knowledge/
+      ├── ToolSelector ──────────► optional Needle2 / main-model fallback
       ├── ToolManager ───────────► local/web utility registry
-      └── Qwen2.5-3B-Instruct
+      └── ModelBackend ──────────► TransformersBackend ──► Qwen or SmolLM2
 
 BGE-small-en-v1.5 runs on CPU and is shared by memory and documents.
 Web messages are stored separately in `data/chat_sessions.db`. Runtime databases and `data/chatbot_debug.log` share the `data/` directory but remain independent files. Defaults are centralized in `app_paths.py` and can be relocated with `CHATBOT_DATA_DIR` or the per-file path overrides.
@@ -57,8 +58,8 @@ Intent, memory, documents, tools, and session history are intentionally separate
 5. The system prompt includes only context actually retrieved.
 6. Chat/web use history; `infer.py` uses only the current turn.
 7. Chat/web may summarize old history and trim lowest-ranked document chunks.
-8. When `tool_use` is true, Qwen receives registered schemas and may request sequential calls within the configured budget.
-9. Each request is treated as untrusted, allowlisted, validated, executed, and returned in a structured envelope; protocol messages remain ephemeral.
+8. When `tool_use` is true, the configured `ToolSelector` receives registered schemas and previous structured results. Needle2 is used when configured; otherwise the active main model provides fallback selection through its backend protocol.
+9. Each request is treated as untrusted, allowlisted, validated, checked against failed-call signatures, executed, and returned in a structured envelope; protocol messages remain ephemeral.
 10. If `memory_write` is true, Qwen extracts facts from the selected evidence source and Python validates/stores them.
 11. Web persists the user/final-assistant pair and returns retrieval trace metadata.
 
@@ -66,7 +67,7 @@ Intent, memory, documents, tools, and session history are intentionally separate
 
 ## 4. Tool system — production, not experimental
 
-Production tool calling lives in `tools/` and `orchestrator.py`.
+Production tool calling lives in `tools/` and `harness/runner.py`.
 
 The registry includes die/random utilities, safe expression/list aggregation,
 Frankfurter daily currency reference rates/conversion, structured Tavily web
@@ -80,6 +81,8 @@ Important behavior:
 - Calculator uses a restricted AST evaluator; production code does not use `eval()`.
 - Tool use is opt-in through the independent `tool_use` intent flag; the default budget is eight attempted calls per turn.
 - Calls execute sequentially, including repeated tools; exhaustion forces a final tools-disabled answer.
+- An identical call that already failed in the current turn is not executed again. The selector receives `duplicate_failed_call`; changed arguments and repeated successful calls remain allowed.
+- Requested action counts are tracked per turn; dependent calculator calls wait for actual prerequisite results, while independent heterogeneous calls may execute in one model response.
 - Tool call/result messages are temporary for the follow-up generation; only the final answer enters normal chat history.
 - Tools are stateless and never write to memory, document, or session databases.
 - Tool logs record schema exposure, generation round, parsed-call count, validation/execution results, and budget exhaustion without adding raw model output.
@@ -124,14 +127,21 @@ Live snapshot at handoff:
 - Retrieval threshold `0.55`, top 4 chunks.
 - Explicit filenames scope retrieval; missing named files do not inject semantic decoys.
 - Sync runs at startup and after web upload/delete.
-- Web upload uses `Path(filename).name`, but has no backend file-size or extension check.
+- Web upload sanitizes basenames, accepts only `.txt`/`.pdf`, enforces a 10 MB backend limit, rejects collisions, and never overwrites an existing document.
 
 Live snapshot: 9 indexed documents, 9 chunks, 5 TXT + 4 PDF files, no deleted DB row.
 
 ## 7. Model and entry-point configuration
 
-- Model: `Qwen/Qwen2.5-3B-Instruct`.
-- Quantization: 4-bit NF4, double quantization, automatic device placement.
+- Default main model: `Qwen/Qwen2.5-3B-Instruct`; `HuggingFaceTB/SmolLM2-1.7B-Instruct` is selectable at startup or from the web UI.
+- `ModelSpec` and `ModelCapabilities` declare model identity, backend, supported behavior, and load options; registry entries contain no loader callables.
+- `create_backend()` constructs the backend. Entry points call `load()`, and normal CLI exit, web switching, and web shutdown call `close()`.
+- `HarnessRunner` sends `GenerationRequest` and consumes `GenerationResult`; it does not access tokenizers, tensors, devices, quantization, or model-family syntax.
+- `TransformersBackend` owns loading, tokenization, chat-template rendering, generation, decoding, device placement, and quantization.
+- Qwen uses its native tool-aware chat template and 4-bit bitsandbytes NF4 with BF16 compute, double quantization, and automatic device placement.
+- SmolLM2 remains non-quantized and uses a compact typed-signature `<tool_call>`/`<tool_result>` compatibility policy inside the backend. Its system instructions are coalesced before actionable messages so late harness enforcement does not displace the user request.
+- Tool selector: main-model fallback by default; optional native `Cactus-Compute/needle2` through `CHATBOT_TOOL_SELECTOR=needle2` and `requirements-needle.txt`.
+- Main-model switching does not reload or replace the active tool selector.
 - Embeddings: `BAAI/bge-small-en-v1.5`, CPU, float32 SQLite blobs.
 - `chat.py`: history on; compression threshold 1,500; keep 2 turns; 300 reply tokens.
 - `infer.py`: history/compression off; 450 reply tokens.
@@ -142,7 +152,7 @@ Live snapshot: 9 indexed documents, 9 chunks, 5 TXT + 4 PDF files, no deleted DB
 - Summary generation: deterministic, default max 200 tokens.
 - Tool schemas are passed only when `tool_use` is true.
 
-The 1,500-token threshold is not a hard cap; oversized current input, memory, or retained history can still exceed it.
+Harness generation settings, capability switches, and maximum tool steps are model-independent. The 1,500-token threshold is not a hard cap; oversized current input, memory, or retained history can still exceed it.
 
 ## 8. Web application
 
@@ -161,10 +171,10 @@ Live session snapshot: 1 session, 18 messages, WAL mode active.
 
 ## 9. Logging and data sensitivity
 
-- `data/chatbot_debug.log` is opened in append mode.
-- Clearing logger handlers prevents duplicates; it does not truncate the file.
+- `data/chatbot_debug.log` uses a 5 MB rotating handler with three backups.
+- Clearing logger handlers prevents duplicates; it does not truncate existing files.
 - Windows attempts to launch a PowerShell live tail.
-- No rotation. Tool payloads are bounded and redact secret-like fields and URL query values; other prompt/user/document logging remains sensitive.
+- Prompt assembly and assistant replies log character counts rather than content. Tool payloads remain bounded and redact secret-like fields and URL query values.
 
 Treat the log as sensitive local data.
 
@@ -176,13 +186,13 @@ Last command run:
 .\qwen-env\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-Results on 2026-08-22 after structured Tavily web search was added:
-**141 pytest tests passed (plus 57 subtests)**. The last unittest discovery run
-before this phase remained **61/61**; pytest is the canonical full suite and was
-run once for this phase.
+Results on 2026-09-04 after the backend-independent model migration:
+**196 pytest tests passed (plus 70 subtests)**. The earlier unittest discovery
+run also passed **80/80**; pytest remains the canonical full suite.
 
 Covered:
 
+- Backend contracts, declarative registry/factory, lifecycle, generation requests/results, Qwen NF4 configuration, native Qwen tool templates, and SmolLM2 textual tool normalization.
 - Hybrid intent parsing/routing/repair/fallback/context inheritance.
 - Memory gating, grounding, duplicates, temporal updates, relation families, and history queries.
 - Prompt conditioning, compression rules, and document-budget trimming.
@@ -197,32 +207,29 @@ Covered:
 Still missing or not rerun for this revision:
 
 - Current live-Qwen tool smoke for all registered tools and non-tool prompts.
+- Broader live-SmolLM2 smoke across every registered tool (a real calculator production-path smoke passes).
 - Full CLI/web startup and restart test.
 - Concurrent web stress.
 - Corrupt/scanned PDF behavior.
 - DB recovery.
 - Very long input and true model-context-limit behavior.
-- Upload type/size/overwrite edge cases.
 
 ## 11. Known risks, in priority order
 
-1. `requirements.txt` is present but unpinned; a clean-environment installation has not been verified.
+1. Current real-model tool selection/argument quality lacks an automated regression for both configured main models.
 2. Web reset semantics can desynchronize RAM and persisted history.
-3. Tool payloads are bounded/redacted, but other sensitive prompt/document logs have no rotation or general redaction.
-4. Web upload has no backend size/extension validation.
-5. “ReadOnly” web memory can still persist fact writes.
-6. Current real-model tool selection/argument quality lacks an automated regression.
-7. The prompt budget is not a hard cap.
-8. Retrieval is brute-force and document routing/retrieval can encode the query twice.
-9. No auth, CSRF protection, or rate limiting; keep the server localhost-only.
-10. Model/bootstrap settings are duplicated across entry points.
+3. The prompt budget is not a hard cap.
+4. Retrieval is brute-force and document routing/retrieval can encode the query twice.
+5. “ReadOnly” web memory suppresses retrieval-cache writes but can still persist intentionally routed fact writes.
+6. No auth, CSRF protection, or rate limiting; keep the server localhost-only.
+7. Intermittent historical native Qwen startup exits remain unexplained, although the current environment has loaded successfully.
 
 ## 12. Locked or intentional decisions
 
 - Separate SQLite databases for memory, documents, and web sessions.
 - Document source files in `knowledge/`; RAG code in `documents/`.
 - BGE on CPU to preserve GPU memory for Qwen.
-- One shared `ConversationOrchestrator` for all entry points.
+- One shared `HarnessRunner` for all entry points; `ConversationOrchestrator` remains a compatibility alias in `orchestrator.py`.
 - Deterministic routing evidence has precedence over Qwen classification.
 - User-only durable memory with temporal invalidation.
 - 4-bit NF4 inference.
@@ -230,21 +237,22 @@ Still missing or not rerun for this revision:
 
 ## 13. Recommended next work
 
-1. Validate `requirements.txt` in a clean environment and identify the canonical environment.
+1. Add opt-in real-Qwen and real-SmolLM2 generation/tool smoke coverage through `ModelBackend`.
 2. Fix or redefine web reset persistence semantics.
-3. Validate upload type, size, and overwrite behavior.
-4. Add a real-Qwen tool smoke suite.
-5. Add logging redaction/rotation controls.
+3. Enforce a true end-to-end prompt/context limit.
+4. Measure and improve retrieval scaling and duplicate query embedding work.
+5. Validate clean-environment installation from the pinned dependency metadata.
 
 ## 14. Rules for future agents
 
 - Treat live code and live DB state as the source of truth.
 - Read relevant files before editing; this handoff can drift.
 - Preserve separation among memory, documents, sessions, intent, and tools unless explicitly redesigning it.
-- Keep tool execution allowlisted and stateless; treat every Qwen-produced tool name and argument as untrusted.
+- Keep model execution behind `models.ModelBackend`; Transformers loading, quantization, and model-specific prompt policies belong in `models/backends.py`.
+- Keep tool execution allowlisted and stateless; treat every model-produced tool name and argument as untrusted.
 - Add tools only through the registry plus centralized validation and tests.
 - Do not use the experiment’s `eval()` calculator in production.
-- Do not describe tool calling as experimental-only; the current production orchestrator uses it.
-- Do not claim there are no automated tests; the current suite has 141 pytest tests (plus 57 subtests), and the last unittest discovery run had 61 tests.
+- Do not describe tool calling as experimental-only; the current production harness uses it.
+- Do not claim there are no automated tests; the current suite has 196 pytest tests (plus 70 subtests), and the latest unittest discovery run has 80 tests.
 - `chat.py` is canonical unless the user says otherwise.
 - Do not create commits unless explicitly requested.

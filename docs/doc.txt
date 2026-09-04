@@ -1,0 +1,991 @@
+> Historical architecture explainer. The model details remain useful, but the
+> current application uses `HarnessRunner`, the `ModelBackend` contracts, a
+> declarative registry, and `TransformersBackend`. See `PROJECT_HANDOFF.md` and
+> `PROJECT_ISSUES.md` for current behavior. `ConversationOrchestrator` is now a
+> compatibility alias, not the canonical implementation.
+
+Small correction first: the default model is **`Qwen/Qwen2.5-3B-Instruct`**, not Qwen 1.5. The handoff records Qwen2.5-3B-Instruct as the default and SmolLM2 as the alternate configured model.
+
+## The project in one sentence
+
+It is a **local, privacy-focused AI assistant** that can:
+
+**chat + remember you + search your documents + use tools + call multiple tools in one turn.**
+
+Think of it like this:
+
+```text
+You
+ ↓
+ConversationOrchestrator
+ ↓
+Qwen 2.5 3B
+ ├─ Memory
+ ├─ Documents / RAG
+ ├─ Tools
+ └─ Chat history
+```
+
+The important architectural idea is that all of these systems are kept separate.
+
+---
+
+# 1. Why Qwen 2.5 3B?
+
+The files confirm the choice, but they **do not contain a formal benchmark explaining why Qwen was selected over Llama, Phi, Mistral, etc.**
+
+What we can safely say from the project design is:
+
+### We wanted a model small enough to run locally
+
+```text
+Qwen2.5-3B-Instruct
+        ↓
+~3B parameters
+        ↓
+small enough for local inference
+```
+
+The project is explicitly designed as a **local, single-user assistant**.
+
+And the project prioritizes:
+
+* privacy
+* bounded execution
+* keeping data local
+* separation of memory/documents/chat
+
+Those are stated as core invariants.
+
+So the practical idea is:
+
+> Don't use a giant cloud model for everything.
+> Run a reasonably capable instruction model locally.
+
+---
+
+# 2. Why the **Instruct** version?
+
+The model is:
+
+```text
+Qwen2.5-3B-Instruct
+```
+
+not just a base language model.
+
+That matters because the assistant needs the model to follow structured instructions such as:
+
+```text
+Classify this intent
+Return JSON
+Use this tool schema
+Extract these memory facts
+Answer using retrieved documents
+```
+
+So conceptually:
+
+```text
+Base model
+→ predicts text
+
+Instruct model
+→ better suited for:
+   instructions
+   chat
+   structured responses
+   tool calling
+```
+
+---
+
+# 3. Quantization: **4-bit NF4**
+
+This is one of the key design decisions.
+
+The project loads Qwen using:
+
+```text
+4-bit NF4
++ double quantization
++ automatic device placement
+```
+
+
+
+### Normal model
+
+Imagine weights like:
+
+```text
+16 bits
+16 bits
+16 bits
+16 bits
+...
+```
+
+Lots of GPU memory.
+
+### Our model
+
+Weights are compressed to roughly:
+
+```text
+4 bits
+4 bits
+4 bits
+4 bits
+...
+```
+
+So GPU memory usage drops dramatically.
+
+---
+
+# 4. Why NF4?
+
+**NF4 = NormalFloat4.**
+
+Very simplified:
+
+Instead of storing each neural-network weight with high precision:
+
+```text
+0.438271
+-0.183472
+0.901251
+```
+
+we approximate them using a very small set of 4-bit values.
+
+Conceptually:
+
+```text
+original weights
+      ↓
+4-bit representation
+      ↓
+much smaller VRAM requirement
+```
+
+The project intentionally locks in **4-bit NF4 inference** as an architectural decision.
+
+---
+
+# 5. Double quantization
+
+There's another memory optimization:
+
+```text
+weights
+ ↓
+quantized to 4-bit
+
+quantization metadata
+ ↓
+also quantized
+```
+
+That second step is **double quantization**.
+
+So:
+
+```text
+NF4
+↓
+compress model weights
+
+Double quantization
+↓
+compress some quantization metadata too
+```
+
+Result:
+
+> even lower memory usage.
+
+The handoff confirms both are enabled.
+
+---
+
+# 6. Why is BGE running on CPU?
+
+Qwen is not the only model.
+
+There is also:
+
+```text
+BAAI/bge-small-en-v1.5
+```
+
+It creates embeddings for:
+
+* long-term memory
+* documents
+
+
+
+But BGE runs on the **CPU**.
+
+Why?
+
+The project explicitly chose:
+
+> BGE on CPU to preserve GPU memory for Qwen.
+
+So:
+
+```text
+GPU
+└─ Qwen
+
+CPU
+└─ BGE embeddings
+```
+
+This is a very sensible resource split for a local machine.
+
+---
+
+# 7. The most important component: `ConversationOrchestrator`
+
+Instead of each interface implementing its own AI logic, everything uses:
+
+```text
+ConversationOrchestrator
+```
+
+There are three interfaces:
+
+```text
+chat.py
+infer.py
+webapp.py
+      ↓
+ConversationOrchestrator
+```
+
+
+
+So the orchestrator is basically the assistant's **brain/controller**.
+
+It decides:
+
+```text
+Do I need memory?
+Do I need documents?
+Do I need tools?
+What context goes to Qwen?
+Should I save something?
+```
+
+---
+
+# 8. Intent routing happens before expensive work
+
+When you send:
+
+> What is my favorite programming language?
+
+The system does **not** blindly search everything.
+
+It first determines intent.
+
+Possible flags include things like:
+
+```text
+memory_read
+memory_write
+document_read
+tool_use
+general_chat
+```
+
+The current lifecycle starts with deterministic evidence, and Qwen only resolves flags that remain uncertain.
+
+So:
+
+```text
+User message
+     ↓
+Intent router
+     ↓
+Which subsystems are actually required?
+```
+
+This keeps the system cheaper and cleaner.
+
+---
+
+# 9. Hybrid routing
+
+This is an important design choice.
+
+Routing works like:
+
+```text
+RULES FIRST
+     ↓
+if obvious → decide immediately
+
+if ambiguous
+     ↓
+ask Qwen classifier
+```
+
+
+
+Example:
+
+```text
+"My name is Sam."
+
+Rule can confidently detect:
+memory_write = true
+```
+
+But something ambiguous may go:
+
+```text
+rules unsure
+     ↓
+Qwen classifier
+```
+
+And importantly:
+
+> deterministic routing evidence has precedence over Qwen classification.
+
+Meaning the LLM cannot casually override a high-confidence rule.
+
+---
+
+# 10. Memory
+
+The assistant has persistent long-term memory.
+
+But it deliberately does **not** store arbitrary everything.
+
+It focuses on durable facts about the user.
+
+Examples:
+
+```text
+name
+lives_in
+works_in
+codes_in
+favorite_programming_language
+prefers_beverage
+```
+
+---
+
+# 11. Memory is not chat history
+
+Very important distinction:
+
+```text
+Chat history
+≠
+Long-term memory
+```
+
+The project intentionally separates:
+
+```text
+agent_memory.db
+documents.db
+chat_sessions.db
+```
+
+
+
+So:
+
+### Chat history
+
+```text
+User: hello
+Assistant: hi
+User: explain Python
+...
+```
+
+### Memory
+
+```text
+user
+favorite_programming_language
+Python
+```
+
+Different databases. Different responsibilities.
+
+---
+
+# 12. Memory has multiple retrieval levels
+
+Simplified:
+
+```text
+Exact lookup
+     ↓
+Tier 1 hot cache
+     ↓
+Tier 2 semantic search
+     ↓
+archive/history
+```
+
+The hot cache holds up to **5 active facts**.
+
+Semantic retrieval uses similarity **> 0.50** and retrieves up to **2 unseen relations**.
+
+You can think:
+
+```text
+Very likely needed
+→ fast cache
+
+Less obvious memory
+→ embedding search
+```
+
+---
+
+# 13. Updating memory
+
+Suppose:
+
+```text
+Earlier:
+"I live in Delhi."
+
+Later:
+"I moved to Bangalore."
+```
+
+The project doesn't simply delete the old fact.
+
+Instead:
+
+```text
+Delhi
+→ invalidated
+
+Bangalore
+→ active
+```
+
+So history is preserved.
+
+That enables questions like:
+
+```text
+Where do I live now?
+
+vs
+
+Where did I live previously?
+```
+
+---
+
+# 14. Document RAG
+
+The assistant can also answer questions about local files.
+
+Currently supported:
+
+```text
+.txt
+.pdf
+```
+
+
+
+Pipeline:
+
+```text
+TXT / PDF
+   ↓
+extract text
+   ↓
+split into chunks
+   ↓
+BGE embeddings
+   ↓
+documents.db
+```
+
+Chunks target roughly:
+
+```text
+350 tokens
+60 token overlap
+```
+
+
+
+---
+
+# 15. Document retrieval
+
+If you ask:
+
+> What does my architecture document say about tools?
+
+The router activates:
+
+```text
+document_read = true
+```
+
+Then:
+
+```text
+your question
+     ↓
+embedding
+     ↓
+compare against document chunks
+     ↓
+best chunks
+     ↓
+insert into Qwen context
+```
+
+Retrieval uses a similarity threshold of **0.55** and returns up to **4 chunks**.
+
+---
+
+# 16. Now we reach tools
+
+This is where the assistant becomes more like an **agent**.
+
+Instead of Qwen trying to answer everything itself:
+
+```text
+Qwen
+ ↓
+"I need external computation/data."
+ ↓
+Tool
+ ↓
+result
+ ↓
+Qwen
+ ↓
+final answer
+```
+
+Production tool calling is implemented in:
+
+```text
+tools/
+orchestrator.py
+```
+
+
+
+---
+
+# 17. Tools are only exposed when required
+
+There is a separate intent flag:
+
+```text
+tool_use
+```
+
+Tool schemas are passed to Qwen **only when `tool_use` is true**.
+
+So normal conversation:
+
+```text
+"Explain recursion"
+```
+
+doesn't need the tool definitions.
+
+But:
+
+```text
+"What is 9234 × 481?"
+```
+
+may activate tools.
+
+---
+
+# 18. What tools exist?
+
+The current handoff describes tools for:
+
+```text
+dice / random numbers
+
+calculator
+
+expression/list aggregation
+
+currency rates + conversion
+
+Tavily web search
+
+webpage text fetching
+
+weather
+
+local file reading
+
+CSV/XLSX analysis
+
+directory listing
+```
+
+
+
+So this moved well beyond the older prototype that only had a few basic tools.
+
+---
+
+# 19. Qwen does NOT directly execute code
+
+This is a major security boundary.
+
+Qwen might produce:
+
+```text
+tool = calculator
+arguments = {
+    expression: "25 * 14"
+}
+```
+
+But that is considered **untrusted input**.
+
+The program then checks:
+
+```text
+Is calculator registered?
+      ↓
+Are arguments JSON?
+      ↓
+Correct fields?
+      ↓
+Correct types?
+      ↓
+Within allowed limits?
+      ↓
+Execute
+```
+
+
+
+The contributing rules explicitly say model-generated tool names and arguments must be treated as untrusted.
+
+---
+
+# 20. Tool allowlist
+
+Qwen cannot invent something like:
+
+```text
+delete_everything()
+```
+
+and have Python execute it.
+
+Only tools in the registry run:
+
+```text
+Qwen request
+     ↓
+Tool registry
+     ↓
+registered?
+   /       \
+ yes       no
+ ↓          ↓
+validate   error
+```
+
+Unknown tools return a structured error.
+
+---
+
+# 21. Calculator safety
+
+The calculator does **not** do:
+
+```python
+eval(model_output)
+```
+
+Instead it uses a restricted Python AST evaluator.
+
+Meaning operations can be restricted to safe arithmetic rather than arbitrary Python code.
+
+The old experimental tool code did use `eval()`, but it is explicitly isolated under `experiments/` and is not the production implementation.
+
+---
+
+# 22. Tool execution loop
+
+Basic tool call:
+
+```text
+User
+ ↓
+Qwen
+ ↓
+tool call
+ ↓
+Python validates
+ ↓
+tool executes
+ ↓
+result returned to Qwen
+ ↓
+Qwen writes answer
+```
+
+The tool call/result messages themselves are temporary.
+
+Only the final assistant response enters normal conversation history.
+
+---
+
+# 23. Multi-tool usage
+
+This is the important upgrade.
+
+The **older audit** described only one tool call per user turn.
+
+But that audit explicitly says it was superseded by later repository changes.
+
+The **current handoff** says Qwen can perform:
+
+```text
+sequential tool calls
+```
+
+with a default budget of:
+
+# **8 attempted tool calls per turn**
+
+
+
+---
+
+# 24. Example of multi-tool usage
+
+Imagine you ask:
+
+> What's the weather in London, convert £100 to INR, and calculate how much ₹50,000 would leave me with afterward?
+
+The system could conceptually do:
+
+```text
+User request
+     ↓
+Qwen
+     ↓
+Tool 1: weather
+     ↓
+result
+     ↓
+Qwen
+     ↓
+Tool 2: currency conversion
+     ↓
+result
+     ↓
+Qwen
+     ↓
+Tool 3: calculator
+     ↓
+result
+     ↓
+Qwen
+     ↓
+Final combined answer
+```
+
+Each call happens **sequentially**, so later calls can be based on earlier results.
+
+---
+
+# 25. Repeated tools are allowed too
+
+Multi-tool doesn't necessarily mean:
+
+```text
+calculator
+then weather
+then currency
+```
+
+It can also be:
+
+```text
+web_search
+↓
+web_search again
+↓
+fetch webpage
+↓
+calculator
+```
+
+The current design explicitly allows **repeated tools** within the tool-call budget.
+
+---
+
+# 26. Why the tool budget exists
+
+Without a limit, an LLM could accidentally loop:
+
+```text
+search
+search
+search
+search
+search
+...
+```
+
+So there is a default:
+
+```text
+MAX TOOL ATTEMPTS = 8
+```
+
+Conceptually.
+
+When the budget is exhausted:
+
+```text
+tools disabled
+↓
+Qwen must produce final answer
+```
+
+
+
+This gives the system **bounded execution**, one of the project's core design goals.
+
+---
+
+# 27. Tool state cannot secretly modify memory
+
+Tools are intentionally **stateless**.
+
+They cannot directly modify:
+
+```text
+memory DB
+documents DB
+session DB
+```
+
+
+
+That separation is important.
+
+Instead:
+
+```text
+Tool
+→ returns information
+
+Orchestrator
+→ controls system state
+```
+
+So a weather/search/calculator function does not get permission to modify your assistant's memory.
+
+---
+
+# 28. Full project mental model
+
+The easiest way to remember the whole architecture is:
+
+```text
+                     USER
+                      │
+                      ▼
+              Intent Router
+                      │
+       ┌──────────────┼───────────────┐
+       │              │               │
+       ▼              ▼               ▼
+    Memory          Documents        Tools
+       │              │               │
+       └──────────────┼───────────────┘
+                      │
+                      ▼
+          ConversationOrchestrator
+                      │
+                      ▼
+            Qwen2.5-3B-Instruct
+                      │
+                      ▼
+                 RESPONSE
+```
+
+With:
+
+```text
+Qwen       → GPU, 4-bit NF4
+BGE        → CPU
+Memory     → SQLite
+Documents  → SQLite + knowledge/
+Sessions   → separate SQLite
+Tools      → allowlisted + stateless
+```
+
+This separation is intentional and is one of the project's locked architectural decisions.
+
+---
+
+# The whole evolution in 12 lines
+
+```text
+1. Choose small local model
+        ↓
+2. Qwen2.5-3B-Instruct
+        ↓
+3. Quantize with 4-bit NF4
+        ↓
+4. Add double quantization
+        ↓
+5. Keep BGE embeddings on CPU
+        ↓
+6. Build shared ConversationOrchestrator
+        ↓
+7. Add hybrid intent routing
+        ↓
+8. Add persistent structured memory
+        ↓
+9. Add document RAG
+        ↓
+10. Add safe allowlisted tools
+        ↓
+11. Add tool execution loop
+        ↓
+12. Upgrade to sequential multi-tool use
+    with an 8-call budget
+```
+
+### If you remember only five things
+
+**Qwen2.5 3B** = local brain.
+**4-bit NF4 + double quantization** = makes it fit comfortably on local hardware.
+**BGE** = embeddings for memory + documents.
+**ConversationOrchestrator** = controller connecting everything.
+**Multi-tool loop** = Qwen can safely make several validated tool calls before giving the final answer.

@@ -1,8 +1,8 @@
-# Qwen Local Chatbot
+# Model-Agnostic Local AI Harness
 
-A private, local-first assistant built around `Qwen/Qwen2.5-3B-Instruct`. It
-combines conversational history, durable user memory, TXT/PDF retrieval, and a
-small allowlisted tool system behind CLI and FastAPI interfaces.
+A private, local-first AI harness with `Qwen/Qwen2.5-3B-Instruct` as its default
+model. It combines conversational history, durable user memory, TXT/PDF
+retrieval, and a small allowlisted tool system behind CLI and FastAPI interfaces.
 
 The model and embeddings run locally after their first download. The weather,
 daily reference-rate, Tavily web-search, and webpage tools are the only production
@@ -10,7 +10,7 @@ features that intentionally make outbound requests.
 
 ## Features
 
-- 4-bit NF4 Qwen inference with automatic device placement.
+- Replaceable model backends, with 4-bit NF4 Qwen inference provided by default.
 - Stateful CLI and browser UI, plus a stateless CLI variant.
 - SQLite-backed user memory and web chat sessions.
 - Recursive TXT/PDF indexing with sentence-aware chunking and semantic search.
@@ -26,12 +26,13 @@ features that intentionally make outbound requests.
 chat.py / infer.py / webapp.py
               |
               v
-   ConversationOrchestrator
+        HarnessRunner
       |-- intent routing
       |-- OfflineMemoryManager --> data/agent_memory.db
       |-- DocumentIndex ---------> data/documents.db + knowledge/
       |-- ToolManager -----------> allowlisted local/web tools
-      `-- Qwen2.5-3B-Instruct
+      |-- ToolSelector ----------> optional Needle2 / main-model fallback
+      `-- ModelBackend ----------> TransformersBackend ----------> Qwen / SmolLM2
 ```
 
 Runtime databases, logs, model caches, and virtual environments are deliberately
@@ -105,12 +106,26 @@ By default, mutable state is written under `data/`:
 Back up or delete this directory independently of the source tree. It is not
 committed.
 
+## Model backends
+
+The supported contract is compatible local causal language models supported by
+an installed backend; universal model compatibility is not claimed. The current
+installation provides `TransformersBackend` with declarative Qwen and SmolLM2
+specifications. Model capabilities are explicit, quantization is backend-owned,
+and model-specific chat/tool formatting does not enter `harness/`.
+
+Qwen remains the 4-bit NF4 default. SmolLM2 remains non-quantized and uses a
+backend-owned textual tool protocol. No llama.cpp or GGUF backend is included.
+
 ## Configuration
 
 Storage and document settings can be overridden with environment variables:
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
+| `CHATBOT_MODEL` | Generation model: `qwen` or `smollm2` | `qwen` |
+| `CHATBOT_TOOL_SELECTOR` | Tool selector: `main_model` or optional `needle2` | `main_model` |
+| `CHATBOT_NEEDLE_MIN_CONFIDENCE` | Minimum accepted Needle2 confidence, from `0` to `1` | `0` |
 | `CHATBOT_DATA_DIR` | Runtime state directory | `./data` |
 | `CHATBOT_MEMORY_DB` | Memory database path | `<data>/agent_memory.db` |
 | `CHATBOT_SESSIONS_DB` | Web session database path | `<data>/chat_sessions.db` |
@@ -120,6 +135,7 @@ Storage and document settings can be overridden with environment variables:
 | `CHATBOT_DOC_CHUNK_SIZE` | Approximate chunk tokens | `350` |
 | `CHATBOT_DOC_CHUNK_OVERLAP` | Approximate overlap tokens | `60` |
 | `CHATBOT_DOC_TOP_K` | Maximum retrieved chunks | `4` |
+| `TOOLS_ALLOWED_ROOTS` | Local-tool roots, separated by the OS path separator | Project root |
 
 Tool safety and size limits use `TOOLS_*` variables documented alongside their
 defaults in [`tools/config.py`](tools/config.py). Private-network webpage access
@@ -132,6 +148,10 @@ PowerShell session, configure it before starting the application:
 ```powershell
 $env:TAVILY_API_KEY = "<your-tavily-api-key>"
 ```
+
+Needle2 is optional. Install `requirements-needle.txt`, then set
+`CHATBOT_TOOL_SELECTOR=needle2`. If its native runtime is unavailable, the
+application logs the failure and retains the main-model tool-selection fallback.
 
 ## Tests
 
@@ -156,7 +176,12 @@ or the executable tool registry.
 - `chat.py` - canonical CLI.
 - `webapp.py` - FastAPI server and embedded browser UI.
 - `infer.py` - stateless CLI variant.
-- `orchestrator.py` - shared turn pipeline and tool loop.
+- `harness/` - run contracts, shared turn pipeline, tracing, and tool loop.
+- `models/` - backend-independent contracts, declarative model registry, and execution backends.
+- `orchestrator.py` - backwards-compatible imports for older integrations.
+- `models/contracts.py` - backend-independent model and generation contracts.
+- `models/backends.py` - Transformers execution and model-specific prompt policies.
+- `model_adapter.py` - backwards-compatible import location for the new backend contracts.
 - `intent_classifier.py` - hybrid intent decisions.
 - `memory_core.py` - durable fact extraction and retrieval.
 - `documents/` - document discovery, extraction, indexing, and retrieval.
@@ -170,9 +195,8 @@ or the executable tool registry.
   tradable market prices.
 - Web search requires a separately provisioned Tavily API key and returns
   result metadata/snippets, not rendered or authenticated webpage content.
-- The dependency list is unpinned and a clean install is not yet continuously
-  verified.
-- Web reset behavior and upload validation need hardening.
-- Logs are not rotated and can contain prompts or document text.
+- Web reset behavior needs hardening.
+- Diagnostic logs contain operational metadata and bounded tool payloads; protect
+  the local `data/` directory accordingly.
 - Retrieval is brute-force and intended for a modest local document collection.
 - This repository does not currently declare an open-source license.

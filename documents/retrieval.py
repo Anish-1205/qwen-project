@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from orchestrator import DocumentRetrievalResult
+from harness import DocumentRetrievalResult
 
 from .config import DOCUMENT_DB_PATH, SIMILARITY_THRESHOLD, TOP_K
 from .db import open_db

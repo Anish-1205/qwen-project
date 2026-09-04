@@ -7,24 +7,21 @@ from __future__ import annotations
 
 import json
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
-
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from orchestrator import ConversationOrchestrator, DEFAULT_SYSTEM_PROMPT
+from harness import ConversationOrchestrator, DEFAULT_SYSTEM_PROMPT
+from models import create_backend, get_model_spec
 from tools.calculator import calculator
 from tools.random_tools import roll_die
 from tools.manager import ToolManager
 from tools.registry import ToolDefinition, ToolRegistry, build_default_registry
 
 
-MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
 OUTPUT_PATH = Path(__file__).with_name("live_tool_policy_acceptance.json")
 
 
@@ -80,10 +77,9 @@ def fixture_manager() -> ToolManager:
     return ToolManager(registry)
 
 
-def run_case(tokenizer, model, prompt: str) -> dict:
+def run_case(backend, prompt: str) -> dict:
     orchestrator = RecordingOrchestrator(
-        tokenizer,
-        model,
+        backend,
         MemoryStub(),
         tool_manager=fixture_manager(),
         reply_generation_kwargs={"max_new_tokens": 450, "do_sample": False},
@@ -151,27 +147,19 @@ def main() -> int:
     prior_report = None
     if OUTPUT_PATH.exists():
         prior_report = json.loads(OUTPUT_PATH.read_text(encoding="utf-8"))
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, local_files_only=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
-        local_files_only=True,
-        quantization_config=BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        ),
-        device_map="auto",
-    )
-    model.eval()
+    configured = get_model_spec("qwen")
+    options = dict(configured.load_options)
+    model_kwargs = dict(options.get("model_kwargs", {}))
+    model_kwargs["local_files_only"] = True
+    options["model_kwargs"] = model_kwargs
+    backend = create_backend(replace(configured, load_options=options))
+    backend.load()
     case_a = run_case(
-        tokenizer,
-        model,
+        backend,
         "Roll a six-sided die twice, then use calculator to add the two actual returned rolls.",
     )
     case_b = run_case(
-        tokenizer,
-        model,
+        backend,
         "Search the web for USD/EUR exchange-rate news and use currency_exchange for 100 USD to EUR. Use search only for news context and the currency tool for the conversion.",
     )
     assess(case_a, case_b)

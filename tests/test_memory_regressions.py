@@ -11,9 +11,10 @@ from pathlib import Path
 import numpy as np
 
 from intent_classifier import IntentDecision
+from models import ModelBackend
 from memory_core import OfflineMemoryManager
-from orchestrator import ConversationOrchestrator, DEFAULT_SYSTEM_PROMPT
-from tests.test_intent_and_orchestration import FakeTokenizer, QueueOrchestrator, StaticClassifier
+from harness import ConversationOrchestrator, DEFAULT_SYSTEM_PROMPT
+from tests.test_intent_and_orchestration import FakeTokenizer, QueueOrchestrator, StaticClassifier, StubBackend
 
 
 class FakeEmbedModel:
@@ -28,6 +29,10 @@ class GroundedSequenceOrchestrator(ConversationOrchestrator):
     def __init__(self, *args, extraction_outputs=None, **kwargs):
         self.extraction_outputs = dict(extraction_outputs or {})
         self.extraction_inputs = []
+        if args and not isinstance(args[0], ModelBackend):
+            if len(args) < 3:
+                raise TypeError("legacy test construction requires tokenizer, model, and memory")
+            args = (StubBackend(), args[2], *args[3:])
         super().__init__(*args, **kwargs)
 
     def generate_reply(self, messages, **overrides):

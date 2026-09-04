@@ -11,9 +11,10 @@ from openpyxl import Workbook
 from pypdf import PdfWriter
 
 from intent_classifier import DeterministicIntentRouter, IntentClassifier, IntentDecision
-from orchestrator import ConversationOrchestrator, DEFAULT_SYSTEM_PROMPT
+from harness import ConversationOrchestrator, DEFAULT_SYSTEM_PROMPT
 from logging_utils import sanitize_tool_log_payload
 from tools import ToolCall, ToolManager
+from tools import config as tool_config
 from tools.directory_listing import list_directory
 from tools.common import validate_public_url
 from tools.config import _bounded_int
@@ -21,6 +22,12 @@ from tools.file_reader import read_file
 from tools.spreadsheet import analyze_spreadsheet
 from tools.weather import FORECAST_URL, GEOCODING_URL, weather
 from tools.web_fetch import fetch_webpage
+from tests.test_intent_and_orchestration import StubBackend
+
+
+@pytest.fixture(autouse=True)
+def allow_test_workspace(tmp_path, monkeypatch):
+    monkeypatch.setattr(tool_config, "LOCAL_ALLOWED_ROOTS", (Path.cwd().resolve(), tmp_path.resolve()))
 
 
 def _xlsx(path: Path, rows, title="Data"):
@@ -49,6 +56,10 @@ def test_parser_contains_malformed_tagged_calls_and_ignores_normal_json():
     assert manager.parse_tool_calls('<tool_call>{"name":"calculator"')[0].name == "__invalid_tool_call__"
     partial_batch = manager.parse_tool_calls('<tool_call>{"name":"calculator","arguments":{"expression":"1+1"}}</tool_call><tool_call>{')
     assert [call.name for call in partial_batch] == ["calculator", "__invalid_tool_call__"]
+    duplicated_wrapper = manager.parse_tool_calls(
+        '<tool_call>\n<tool_call>\n{"name":"calculator","arguments":{"expression":"1+1"}}\n</tool_call>'
+    )
+    assert [call.name for call in duplicated_wrapper] == ["calculator"]
 
 
 def test_dispatcher_bounds_the_complete_result_envelope(tmp_path):
@@ -363,7 +374,7 @@ class FakeMemory:
     last_retrieval_stats = {"facts": []}
 
 class QueueOrchestrator(ConversationOrchestrator):
-    def __init__(self, outputs, **kwargs): self.outputs=list(outputs); self.inputs=[]; self.overrides=[]; super().__init__(FakeTokenizer(), object(), FakeMemory(), logger=kwargs.pop("logger", lambda _: None), **kwargs)
+    def __init__(self, outputs, **kwargs): self.outputs=list(outputs); self.inputs=[]; self.overrides=[]; super().__init__(StubBackend(), FakeMemory(), logger=kwargs.pop("logger", lambda _: None), **kwargs)
     def generate_reply(self, messages, **overrides):
         self.inputs.append([dict(m) for m in messages]); self.overrides.append(overrides)
         return self.outputs.pop(0)
@@ -380,11 +391,11 @@ def test_multi_tool_loop_budget_and_ephemeral_history():
     tool_ids = [m["tool_call_id"] for m in orchestrator.inputs[-1] if m["role"] == "tool"]
     assert tool_ids == ["tool_call_1", "tool_call_2"]
     exhausted = QueueOrchestrator([calls[0], "budget answer"])
-    with patch("orchestrator.MAX_TOOL_CALLS_PER_TURN", 1):
+    with patch("harness.runner.MAX_TOOL_CALLS_PER_TURN", 1):
         _, reply, _, _ = exhausted.process_turn("Calculate 1+1 and 2+2", [{"role":"system","content":DEFAULT_SYSTEM_PROMPT}], turn_number=1)
     assert reply == "budget answer" and exhausted.overrides[-1] == {}
     uncooperative = QueueOrchestrator([calls[0], calls[1]])
-    with patch("orchestrator.MAX_TOOL_CALLS_PER_TURN", 1):
+    with patch("harness.runner.MAX_TOOL_CALLS_PER_TURN", 1):
         _, reply, _, _ = uncooperative.process_turn("Calculate 1+1 and 2+2", [{"role":"system","content":DEFAULT_SYSTEM_PROMPT}], turn_number=1)
     assert "tool-call limit" in reply and "<tool_call>" not in reply
 
@@ -402,12 +413,16 @@ def test_tool_generation_rejects_no_call_completion_after_one_bounded_correction
     assert len(orchestrator.inputs) == 2
     assert "normal assistant answer cannot complete" in orchestrator.inputs[1][-1]["content"].lower()
     assert any(
-        "[Tool Generation] round=1 schemas=9" in message
+        "[Tool Selection] selector=main_model_fallback" in message and "round=1 schemas=9" in message
         and "calculator" in message
         and "fetch_webpage" not in message
         for message in logs
     )
-    assert any("[Tool Generation] round=1 parsed_calls=0 outcome=no_tool_call" in message for message in logs)
+    assert any(
+        "[Tool Selection] selector=main_model_fallback" in message
+        and "round=1 parsed_calls=0 outcome=no_tool_call" in message
+        for message in logs
+    )
     assert any("[Tool Enforcement] Rejected normal response" in message for message in logs)
 
 
@@ -438,6 +453,23 @@ def test_multiple_calls_in_one_model_message_execute_in_order():
     assert [result.data["value"] for result in orchestrator.last_tool_executions] == [7, 11]
 
 
+def test_independent_different_tools_in_one_model_message_execute_without_regeneration():
+    combined = (
+        '<tool_call>{"name":"roll_die","arguments":{"sides":20}}</tool_call>'
+        '<tool_call>{"name":"random_number","arguments":{"minimum":100,"maximum":200}}</tool_call>'
+    )
+    orchestrator = QueueOrchestrator([combined, "The values are 7 and 143."])
+    with patch("tools.random_tools.random.randint", side_effect=[7, 143]):
+        _, reply, _, _ = orchestrator.process_turn(
+            "Roll a 20-sided die and generate a random number between 100 and 200.",
+            [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}],
+            turn_number=1,
+        )
+    assert reply == "The values are 7 and 143."
+    assert [result.call.name for result in orchestrator.last_tool_executions] == ["roll_die", "random_number"]
+    assert len(orchestrator.inputs) == 2
+
+
 def test_dependent_calculation_uses_actual_prior_die_results():
     outputs = [
         '<tool_call>{"name":"roll_die","arguments":{"sides":6}}</tool_call>',
@@ -459,6 +491,36 @@ def test_dependent_calculation_uses_actual_prior_die_results():
     assert [result.data["value"] for result in orchestrator.last_tool_executions] == [2, 5, 7]
     final_tool_payloads = [json.loads(message["content"]) for message in orchestrator.inputs[-1] if message["role"] == "tool"]
     assert [payload["data"]["value"] for payload in final_tool_payloads] == [2, 5, 7]
+
+
+def test_mixed_random_dependencies_are_completed_before_calculator():
+    outputs = [
+        '<tool_call>{"name":"calculator","arguments":{"expression":"roll_die + random_number"}}</tool_call>',
+        '<tool_call>{"name":"roll_die","arguments":{"sides":20}}</tool_call>',
+        '<tool_call>{"name":"random_number","arguments":{"minimum":100,"maximum":200}}</tool_call>',
+        '<tool_call>{"name":"calculator","arguments":{"expression":"7 + 143"}}</tool_call>',
+        "The roll was 7, the random number was 143, and their total is 150.",
+    ]
+    orchestrator = QueueOrchestrator(outputs)
+
+    with patch("tools.random_tools.random.randint", side_effect=[7, 143]):
+        _, reply, _, _ = orchestrator.process_turn(
+            "Roll a 20-sided die, generate a random number between 100 and 200, then add the two results together.",
+            [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}],
+            turn_number=1,
+        )
+
+    assert reply.endswith("their total is 150.")
+    assert [result.call.name for result in orchestrator.last_tool_executions] == [
+        "calculator", "roll_die", "random_number", "calculator",
+    ]
+    assert orchestrator.last_tool_executions[0].error_details["code"] == "dependency_not_ready"
+    assert all(result.ok for result in orchestrator.last_tool_executions[1:])
+    assert orchestrator.last_tool_ledger[-1].arguments == {"expression": "7 + 143"}
+    initial_progress = orchestrator.inputs[0][-1]["content"]
+    assert "roll_die (0/1)" in initial_progress
+    assert "random_number (0/1)" in initial_progress
+    assert "using their literal returned numeric values" in initial_progress
 
 
 def test_tool_call_ids_are_unique_and_malformed_calls_can_recover():
@@ -489,9 +551,12 @@ def test_tool_payload_context_serialization_stays_valid_and_bounded():
 
 def test_cumulative_tool_arguments_and_results_stay_within_context_budget():
     expression = "1+" * 5_000 + "1"
-    call = f'<tool_call>{{"name":"calculator","arguments":{{"expression":{json.dumps(expression)}}}}}</tool_call>'
-    orchestrator = QueueOrchestrator([call] * 8 + ["budget answer"])
-    with patch("orchestrator.MAX_TOOL_CALLS_PER_TURN", 8), patch("orchestrator.MAX_TOOL_CONTEXT_CHARS", 2_000):
+    calls = [
+        f'<tool_call>{{"name":"calculator","arguments":{{"expression":{json.dumps(expression + "+" + str(index))}}}}}</tool_call>'
+        for index in range(8)
+    ]
+    orchestrator = QueueOrchestrator(calls + ["budget answer"])
+    with patch("harness.runner.MAX_TOOL_CALLS_PER_TURN", 8), patch("harness.runner.MAX_TOOL_CONTEXT_CHARS", 2_000):
         _, reply, _, _ = orchestrator.process_turn("Calculate these values", [{"role":"system","content":DEFAULT_SYSTEM_PROMPT}], turn_number=1)
     assert "tool-call limit" in reply
     tool_messages = [message for message in orchestrator.inputs[-1] if message["role"] == "tool"]

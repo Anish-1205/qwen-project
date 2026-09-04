@@ -50,7 +50,11 @@ def build_default_registry() -> ToolRegistry:
             "base_currency": {"type": "string", "minLength": 3, "maxLength": 3},
             "quote_currency": {"type": "string", "minLength": 3, "maxLength": 3},
             "amount": {"type": "number", "minimum": 0, "maximum": config.CURRENCY_MAX_AMOUNT},
-            "date": {"type": "string", "minLength": 10, "maxLength": 10},
+            # Qwen sometimes serializes an omitted optional date as an empty
+            # string.  The implementation already treats that as "latest";
+            # expose the same contract at the schema boundary so an otherwise
+            # valid multi-call batch is not rejected and regenerated.
+            "date": {"type": "string", "maxLength": 10},
         }, ["base_currency", "quote_currency"]),
     ))
     r.register(ToolDefinition(

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from enum import Enum
 from typing import Callable, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
@@ -27,6 +28,22 @@ class IntentDecision:
         return cls(memory_read=True, memory_write=True, document_read=True, general_chat=True, tool_use=False)
 
 
+class ConfidenceTier(str, Enum):
+    HIGH = "high"
+    MEDIUM = "medium"
+    VERY_LOW = "very_low"
+
+
+@dataclass(frozen=True, slots=True)
+class IntentFlagEvidence:
+    """Auditable evidence for one independently routed subsystem flag."""
+
+    value: bool | None
+    confidence: ConfidenceTier
+    source: str
+    reason: str
+
+
 @dataclass(frozen=True, slots=True)
 class DeterministicIntentEvidence:
     """High-confidence per-flag evidence; ``None`` delegates that flag to Qwen."""
@@ -38,6 +55,7 @@ class DeterministicIntentEvidence:
     tool_use: bool | None = None
     sources: tuple[tuple[str, str], ...] = ()
     reasons: tuple[tuple[str, str], ...] = ()
+    flag_evidence: tuple[tuple[str, IntentFlagEvidence], ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -51,6 +69,21 @@ class DeterministicIntentEvidence:
 
     def reason_for(self, flag: str) -> str:
         return dict(self.reasons).get(flag, "semantic fallback")
+
+    def evidence_for(self, flag: str) -> IntentFlagEvidence:
+        explicit = dict(self.flag_evidence).get(flag)
+        if explicit is not None:
+            return explicit
+        value = getattr(self, flag)
+        return IntentFlagEvidence(
+            value=value,
+            confidence=ConfidenceTier.HIGH if value is not None else ConfidenceTier.MEDIUM,
+            source=self.source_for(flag),
+            reason=self.reason_for(flag),
+        )
+
+    def confidence_for(self, flag: str) -> ConfidenceTier:
+        return self.evidence_for(flag).confidence
 
 
 class DeterministicIntentRouter:
@@ -144,6 +177,27 @@ class DeterministicIntentRouter:
         r"|\bhow\s+(?:hot|cold|warm|cool)\s+is\s+it\s+(?:in|at)\b"
         r"|\b(?:is|are)\s+there\s+(?:any\s+)?(?:rain|snow|precipitation)\s+(?:in|at)\b",
         re.I,
+    )
+    _DEICTIC_WEATHER_REQUEST = re.compile(
+        r"\b(?:check|get|show|tell\s+me|what(?:'s|\s+is))\b[^?.!;]{0,50}\bweather\s+(?:there|here)\b"
+        r"|\bweather\s+(?:there|here)\b",
+        re.I,
+    )
+    _EXPLICIT_WEATHER_LOCATION = re.compile(
+        r"\b(?i:(?:weather|forecast|temperature|conditions)\s+(?:in|at|for))\s+"
+        r"(?P<place>[A-Za-z][A-Za-z'-]*(?:\s+[A-Za-z][A-Za-z'-]*){0,2}?)"
+        r"(?=\s+(?i:today|tomorrow|now|currently|right\s+now|please)\b|\s*[?.!,;]|\s*$)"
+    )
+    _EXPLICIT_FIRST_PERSON_LOCATION = re.compile(
+        r"\b(?i:(?:i(?:'ve|\s+have)?\s+(?:(?:just|recently)\s+)?moved\s+to"
+        r"|i\s+(?:now\s+|currently\s+)?(?:live|reside)\s+in"
+        r"|i(?:'m|\s+am)\s+(?:currently\s+)?visiting))\s+"
+        r"(?P<place>[A-Z][A-Za-z'-]*(?:\s+[A-Z][A-Za-z'-]*){0,2})\b"
+    )
+    _DURABLE_FIRST_PERSON_LOCATION = re.compile(
+        r"\b(?i:(?:i(?:'ve|\s+have)?\s+(?:(?:just|recently)\s+)?moved\s+to"
+        r"|i\s+(?:now\s+|currently\s+)?(?:live|reside)\s+in))\s+"
+        r"(?P<place>[A-Z][A-Za-z'-]*(?:\s+[A-Z][A-Za-z'-]*){0,2})\b"
     )
     _CURRENCY_EXCHANGE_REQUEST = re.compile(
         r"\b(?:convert|exchange)\b[^?.!]{0,120}\b(?:to|into|for)\b"
@@ -278,12 +332,20 @@ class DeterministicIntentRouter:
         return transition and programming_context and first_person_change
 
     @classmethod
-    def _assertion_segments(cls, text: str) -> list[str]:
-        segments = re.split(
-            r"(?<=[.!?;])\s+|,\s*(?=(?:what|where|who|which|when|why|how|do|does|did|can|could|would|will|is|are|have|has)\b)",
+    def _clause_segments(cls, text: str) -> list[str]:
+        return [
+            segment.strip()
+            for segment in re.split(
+            r"(?<=[.!?;])\s+|[,;]\s*(?=(?:(?:and|then)\s+)?(?:what|where|who|which|when|why|how|do|does|did|can|could|would|will|is|are|have|has|check|get|show|tell|fetch|read|open)\b)",
             text or "",
             flags=re.I,
-        )
+            )
+            if segment.strip()
+        ]
+
+    @classmethod
+    def _assertion_segments(cls, text: str) -> list[str]:
+        segments = cls._clause_segments(text)
         result: list[str] = []
         for segment in segments:
             cleaned = segment.strip()
@@ -328,12 +390,50 @@ class DeterministicIntentRouter:
         return tuple(dict.fromkeys(relations))
 
     @classmethod
+    def explicit_current_turn_location(cls, text: str, *, durable_only: bool = False) -> str | None:
+        """Extract a conservative first-person location usable for same-turn references."""
+        pattern = cls._DURABLE_FIRST_PERSON_LOCATION if durable_only else cls._EXPLICIT_FIRST_PERSON_LOCATION
+        match = pattern.search(text or "")
+        if not match:
+            return None
+        place = match.group("place").strip()
+        if not all(part[:1].isupper() for part in place.split()):
+            return None
+        return place
+
+    @classmethod
+    def resolve_weather_reference(cls, text: str, recent_messages: Sequence[dict]) -> str | None:
+        """Resolve weather 'there/here' from current evidence, then recent durable user facts."""
+        explicit = cls._EXPLICIT_WEATHER_LOCATION.search(text or "")
+        if explicit:
+            place = explicit.group("place").strip()
+            return " ".join(part[:1].upper() + part[1:] for part in place.split())
+        if not cls._DEICTIC_WEATHER_REQUEST.search(text or ""):
+            return None
+        current = cls.explicit_current_turn_location(text)
+        if current:
+            return current
+        recent_users = [message for message in recent_messages if message.get("role") == "user"]
+        for message in reversed(recent_users[-6:]):
+            location = cls.explicit_current_turn_location(
+                str(message.get("content", "")),
+                durable_only=True,
+            )
+            if location:
+                return location
+        return None
+
+    @classmethod
     def is_contextual_memory_command(cls, text: str) -> bool:
         normalized = re.sub(r"\s+", " ", (text or "").strip())
+        # A deictic suffix such as "Remember that" refers to the current turn
+        # when this same message already contains a durable assertion. Only a
+        # genuinely assertion-free command may inherit an earlier turn.
+        if cls.asserted_memory_relations(normalized):
+            return False
         return bool(
             cls._MEMORY_ACTION.search(normalized)
             and cls._CONTEXT_REFERENCE.search(normalized)
-            and not cls.asserted_memory_relations(normalized)
         )
 
     @classmethod
@@ -429,11 +529,13 @@ class DeterministicIntentRouter:
     def analyze(self, user_input: str, recent_messages: Sequence[dict]) -> DeterministicIntentEvidence:
         text = re.sub(r"\s+", " ", (user_input or "").strip())
         asserted = self.asserted_memory_relations(text)
+        has_current_assertion = bool(asserted)
+        contextual_memory_command = bool(
+            not has_current_assertion and self.is_contextual_memory_command(text)
+        )
         question = self.is_question(text)
         question_segments = [
-            segment.strip()
-            for segment in re.split(r"(?<=[.!?;])\s+", text)
-            if segment.strip() and self.is_question(segment)
+            segment for segment in self._clause_segments(text) if self.is_question(segment)
         ]
         question_scope = " ".join(question_segments) if question_segments else text
         explicit_document_cue = bool(self._DOCUMENT_CUES.search(text))
@@ -443,6 +545,8 @@ class DeterministicIntentRouter:
             or re.search(r"\bhere\b|\b(?:this|that|the\s+current|current|local)\s+(?:folder|directory|project)\b", text, re.I)
         )
         organization_knowledge = self.is_organization_knowledge_request(text)
+        deictic_weather_request = bool(self._DEICTIC_WEATHER_REQUEST.search(text))
+        resolved_weather_location = self.resolve_weather_reference(text, recent_messages)
         document_cue = (explicit_document_cue and not explicit_local_path) or organization_knowledge
         directory_request = bool(self._DIRECTORY_REQUEST.search(text) or self._DIRECTORY_PATH_REQUEST.search(text))
         directory_discussion = bool(self._DIRECTORY_DISCUSSION.search(text) and not local_directory_target)
@@ -450,6 +554,7 @@ class DeterministicIntentRouter:
         tool_request = bool(
             self.current_turn_webpage_urls(text)
             or self._WEATHER_REQUEST.search(text)
+            or (deictic_weather_request and resolved_weather_location)
             or self._CURRENCY_EXCHANGE_REQUEST.search(text)
             or self.is_web_search_request(text)
             or (explicit_local_path and self._TOOL_ACTION.search(text))
@@ -471,7 +576,11 @@ class DeterministicIntentRouter:
             document_cue = organization_knowledge
         clear_general = bool(self._CLEAR_GENERAL_CUE.search(question_scope) or directory_discussion)
         contextual = bool(self._CONTEXT_REFERENCE.search(text))
-        antecedent = self.resolve_memory_write_source(text, recent_messages) if self.is_contextual_memory_command(text) else None
+        antecedent = (
+            self.resolve_memory_write_source(text, recent_messages)
+            if contextual_memory_command
+            else None
+        )
         inherited_routes = self._contextual_read_routes(text, recent_messages)
 
         values: dict[str, bool | None] = {
@@ -484,10 +593,21 @@ class DeterministicIntentRouter:
         sources: dict[str, str] = {}
         reasons: dict[str, str] = {}
 
-        def decide(flag: str, value: bool, reason: str, source: str = "deterministic") -> None:
+        confidences: dict[str, ConfidenceTier] = {
+            flag: ConfidenceTier.MEDIUM for flag in values
+        }
+
+        def decide(
+            flag: str,
+            value: bool,
+            reason: str,
+            source: str = "deterministic",
+            confidence: ConfidenceTier = ConfidenceTier.HIGH,
+        ) -> None:
             values[flag] = value
             sources[flag] = source
             reasons[flag] = reason
+            confidences[flag] = confidence
 
         profile_question = bool(
             question
@@ -511,7 +631,9 @@ class DeterministicIntentRouter:
         elif inherited_routes or asserted or antecedent or document_cue or not contextual:
             decide("memory_read", False, "no user-memory recall request")
 
-        if asserted:
+        # Current-turn durable facts always outrank deictic memory wording in
+        # the same message. Context lookup is considered only when none exist.
+        if has_current_assertion:
             decide("memory_write", True, "durable first-person assertion in current message")
         elif antecedent:
             decide(
@@ -524,6 +646,10 @@ class DeterministicIntentRouter:
             decide("memory_write", False, "question contains no asserted or referenced durable fact")
         elif not contextual:
             decide("memory_write", False, "no durable first-person assertion")
+        elif contextual_memory_command and antecedent is None:
+            reasons["memory_write"] = "contextual memory update has no durable antecedent"
+            sources["memory_write"] = "deterministic_conflict"
+            confidences["memory_write"] = ConfidenceTier.VERY_LOW
 
         if "document_read" in inherited_routes:
             decide(
@@ -572,11 +698,34 @@ class DeterministicIntentRouter:
                     decide(flag, False, "utility request contains no evidence for this subsystem")
             if values["general_chat"] is None:
                 decide("general_chat", False, "request is fully covered by tool use")
-        elif (
+        elif not deictic_weather_request and (
             asserted or profile_question or explicit_recall or document_cue or clear_general
             or negated_or_discussion or (not question and not self._TOOL_ACTION.search(text))
         ):
             decide("tool_use", False, "no request to execute a utility tool")
+
+        unresolved_action = bool(self._TOOL_ACTION.search(text) and contextual and not tool_request)
+        if values["tool_use"] is None and unresolved_action:
+            reasons["tool_use"] = "action refers to a missing or ambiguous target"
+            sources["tool_use"] = "deterministic_conflict"
+            confidences["tool_use"] = ConfidenceTier.VERY_LOW
+        if values["tool_use"] is None and deictic_weather_request and not resolved_weather_location:
+            reasons["tool_use"] = "weather request refers to a location that cannot be resolved"
+            sources["tool_use"] = "deterministic_conflict"
+            confidences["tool_use"] = ConfidenceTier.VERY_LOW
+
+        flag_evidence = tuple(
+            (
+                flag,
+                IntentFlagEvidence(
+                    value=values[flag],
+                    confidence=confidences[flag],
+                    source=sources.get(flag, "semantic_llm"),
+                    reason=reasons.get(flag, "deterministic evidence was inconclusive"),
+                ),
+            )
+            for flag in values
+        )
 
         return DeterministicIntentEvidence(
             memory_read=values["memory_read"],
@@ -586,6 +735,7 @@ class DeterministicIntentRouter:
             tool_use=values["tool_use"],
             sources=tuple(sources.items()),
             reasons=tuple(reasons.items()),
+            flag_evidence=flag_evidence,
         )
 
 

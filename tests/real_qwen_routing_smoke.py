@@ -12,14 +12,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-
 from intent_classifier import IntentClassifier, IntentDecision
-from orchestrator import ConversationOrchestrator
-
-
-MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
+from harness import ConversationOrchestrator
+from models import create_backend, get_model_spec
 
 
 def as_dict(decision: IntentDecision) -> dict[str, bool]:
@@ -33,23 +28,12 @@ def as_dict(decision: IntentDecision) -> dict[str, bool]:
 
 
 def main() -> int:
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
-        quantization_config=BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        ),
-        dtype="auto",
-        device_map="auto",
-    )
-    model.eval()
+    model_spec = get_model_spec("qwen")
+    backend = create_backend(model_spec)
+    backend.load()
     orchestrator = ConversationOrchestrator(
-        tokenizer,
-        model,
-        memory=object(),
+        backend,
+        object(),
         logger=lambda message: None,
     )
     semantic_classifier: IntentClassifier = orchestrator.intent_classifier
@@ -120,7 +104,16 @@ def main() -> int:
             }
         )
 
-    print(json.dumps({"model": MODEL_ID, "passed": not failed, "cases": records}, indent=2))
+    print(
+        json.dumps(
+            {
+                "model": model_spec.model_id,
+                "passed": not failed,
+                "cases": records,
+            },
+            indent=2,
+        )
+    )
     return 1 if failed else 0
 
 

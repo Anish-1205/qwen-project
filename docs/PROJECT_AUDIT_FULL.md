@@ -1,10 +1,12 @@
-# Qwen Local Chatbot — Current Repository Audit
+# Qwen Local Chatbot — Historical Repository Audit
 
 > Historical snapshot: this audit is dated 2026-08-20. Its production-tool
 > inventory, orchestration limits, test counts, and dependency findings were
 > superseded by later repository changes. Use `PROJECT_HANDOFF.md` for the
 > current architecture and `PROJECT_ISSUES.md` for current status and regression
-> history.
+> history. Current execution code lives under `harness/`; backend-independent
+> contracts, the declarative model registry, and `TransformersBackend` live
+> under `models/`; and the old `orchestrator.py` name is compatibility-only.
 
 **Audit date:** 2026-08-20
 

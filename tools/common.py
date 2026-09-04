@@ -17,11 +17,18 @@ class ToolError(ValueError):
         self.details = details or {}
 
 
-def resolve_file(path: str, extensions: set[str], max_bytes: int) -> Path:
+def resolve_local_path(path: str) -> Path:
     candidate = Path(path).expanduser()
     if not candidate.is_absolute():
         candidate = Path.cwd() / candidate
     candidate = candidate.resolve()
+    if not any(candidate == root or candidate.is_relative_to(root) for root in config.LOCAL_ALLOWED_ROOTS):
+        raise ToolError("path_outside_allowed_roots", "The requested path is outside the configured local roots.")
+    return candidate
+
+
+def resolve_file(path: str, extensions: set[str], max_bytes: int) -> Path:
+    candidate = resolve_local_path(path)
     if not candidate.exists():
         raise ToolError("path_not_found", "The requested path does not exist.", {"path": str(candidate)})
     if not candidate.is_file():

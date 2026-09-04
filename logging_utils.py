@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import re
 import os
 import subprocess
@@ -68,7 +69,8 @@ def debug_separator() -> str:
     return dim_text("" )
 
 
-_TAG_PATTERN = re.compile(r"\[(Memory Retrieval|Document Retrieval|Prompt Assembly|Router|Assistant Reply|Status|Documents|Tool Generation|Tool Call|Tool Result)\]")
+_TAG_PATTERN = re.compile(r"\[([^\]]+)\]")
+_EVENT_PATTERN = re.compile(r"^(?:\[Turn (\d+)\]\s*)?\[([^\]]+)\]\s*(.*)$", re.DOTALL)
 
 _SENSITIVE_FIELD = re.compile(r"(?:token|api_?key|access_?key|private_?key|secret|password|passwd|authorization|cookie|credential|session_?id)", re.I)
 _URL_IN_TEXT = re.compile(r"https?://[^\s\"'<>]+", re.I)
@@ -152,23 +154,32 @@ class DebugLogFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         message = record.getMessage()
-        turn_match = re.match(r"\[Turn (\d+)\]", message)
-        if turn_match:
-            turn_number = int(turn_match.group(1))
+        event_match = _EVENT_PATTERN.match(message)
+        turn_number = int(event_match.group(1)) if event_match and event_match.group(1) else None
+        starts_new_turn = False
+        if turn_number is not None:
             if self._last_turn is not None and turn_number != self._last_turn:
-                message = f"\n{message}"
+                starts_new_turn = True
             self._last_turn = turn_number
-
-        message = self._emphasize_tags(message)
-        message = self._style_lines(message)
-
-        timestamp = f"{DIM}{self.formatTime(record, self.datefmt)}{RESET}"
-        level_color = self._color_level(record.levelname)
-        level = f"[{record.levelname}]"
-        if level_color:
-            level = f"{level_color}{level}{RESET}"
-
-        return f"{timestamp} {level} {message}"
+        prefix = f"{self.formatTime(record, self.datefmt)} | {record.levelname:<7}"
+        if event_match:
+            category = event_match.group(2)
+            detail = event_match.group(3).strip()
+            heading = f"TURN {turn_number} · {category}" if turn_number is not None else category
+            if detail.startswith("{"):
+                try:
+                    detail = json.dumps(json.loads(detail), ensure_ascii=False, indent=2, sort_keys=True)
+                except ValueError:
+                    pass
+            detail_lines = detail.splitlines() if detail else []
+            rendered = f"{prefix} | {heading}"
+            if detail_lines:
+                rendered += "\n" + "\n".join(f"    {line}" for line in detail_lines)
+        else:
+            rendered = f"{prefix} | {message}"
+        if record.exc_info:
+            rendered += "\n" + self.formatException(record.exc_info)
+        return ("\n" if starts_new_turn else "") + rendered
 
 
 def setup_debug_logger(log_path: str | Path = DEFAULT_LOG_PATH) -> tuple[logging.Logger, Path]:
@@ -183,7 +194,7 @@ def setup_debug_logger(log_path: str | Path = DEFAULT_LOG_PATH) -> tuple[logging
         logger.removeHandler(handler)
         handler.close()
 
-    handler = logging.FileHandler(resolved_path, encoding="utf-8")
+    handler = RotatingFileHandler(resolved_path, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
     handler.setLevel(logging.DEBUG)
     handler.setFormatter(DebugLogFormatter())
     logger.addHandler(handler)

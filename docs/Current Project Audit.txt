@@ -1,8 +1,8 @@
 # Current Project Audit
 
-Last verified: 20 August 2026.
+Last verified: 28 August 2026.
 
-The canonical, fully updated audit is:
+The dated historical audit is:
 
     docs/PROJECT_AUDIT_FULL.md
 
@@ -14,14 +14,14 @@ This file is intentionally a short index so that two long audit documents do not
 
 Current headline status:
 
-- Tool calling is integrated into the production ConversationOrchestrator.
-- Approved tools are calculator, roll_die, and random_number.
-- Production tool arguments are allowlisted and validated; the calculator uses a restricted AST evaluator rather than eval().
-- The historical prototype remains under experiments/ and is not production code.
-- The discoverable unittest suite contains 59 tests; 59/59 passed on 20 August 2026.
-- Live read-only database snapshot: 6 memory archive rows (4 active), 4 cache rows, 9 indexed documents/9 chunks, and 1 web session/18 messages.
-- The old duplicate-active-memory defect is fixed in current code and not present in active live relations.
-- No dependency manifest exists.
-- Current top risks are web reset persistence semantics, sensitive unrotated logs, missing upload size/type validation, and lack of an exact-revision end-to-end real-Qwen regression.
+- `HarnessRunner` is backend-independent and consumes `ModelBackend` through typed generation contracts.
+- The declarative registry currently configures Qwen 2.5 3B and SmolLM2 through `TransformersBackend`.
+- Qwen retains 4-bit NF4 inference; SmolLM2 remains non-quantized with backend-owned textual tool formatting.
+- Tool calling is integrated into the production harness with ten allowlisted, validated tools.
+- Model switching and normal application shutdown use the backend lifecycle without Torch/Transformers logic in `harness/` or the web layer.
+- The complete deterministic suite passes: 193 pytest tests plus 70 subtests; unittest discovery passes 80/80.
+- Dependency pins, rotating content-minimized logs, backend upload bounds, and local-tool root restrictions are implemented.
+- The latest recorded live-data snapshot remains in `PROJECT_HANDOFF.md`; it was not reread during the backend migration.
+- Current top risks include real-model Qwen/SmolLM2 regression coverage, web reset persistence semantics, prompt hard limits, retrieval scaling, and localhost-only security assumptions.
 
-The workspace is not currently a Git repository, so there is no commit or branch identifier for this audit.
+The workspace is a Git repository with extensive pre-existing uncommitted work. No commit was created for the backend migration.

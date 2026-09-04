@@ -55,12 +55,17 @@ class ToolManager:
         text = (model_output or "").strip()
         tagged = re.findall(r"<tool_call>\s*(.*?)\s*</tool_call>", text, flags=re.DOTALL)
         incomplete_tag = text.count("<tool_call>") != text.count("</tool_call>")
+        recovered_nested_wrapper = False
         if not tagged and "<tool_call" in text:
             return [ToolCall("__invalid_tool_call__", {"__invalid_arguments__": "[incomplete tool call]"})]
         candidates = tagged or ([text] if text.startswith("{") and text.endswith("}") else [])
         calls: list[ToolCall] = []
         for index, candidate in enumerate(candidates, 1):
-            try: payload = ToolManager._strict_json_loads(candidate)
+            normalized_candidate = candidate.strip()
+            while normalized_candidate.startswith("<tool_call>"):
+                recovered_nested_wrapper = True
+                normalized_candidate = normalized_candidate[len("<tool_call>"):].strip()
+            try: payload = ToolManager._strict_json_loads(normalized_candidate)
             except (TypeError, ValueError, json.JSONDecodeError):
                 if tagged: calls.append(ToolCall("__invalid_tool_call__", {"__invalid_arguments__": "[malformed JSON]"}, f"tool_call_{index}"))
                 continue
@@ -83,7 +88,7 @@ class ToolManager:
                 if len(call_id) > 128:
                     call_id = f"tool_call_{index}"
                 calls.append(ToolCall(name, arguments, call_id))
-        if tagged and incomplete_tag:
+        if tagged and incomplete_tag and not recovered_nested_wrapper:
             calls.append(ToolCall("__invalid_tool_call__", {"__invalid_arguments__": "[incomplete tool call]"}, f"tool_call_{len(calls) + 1}"))
         return calls
     @classmethod
@@ -91,17 +96,39 @@ class ToolManager:
         calls = cls.parse_tool_calls(model_output)
         return calls[0] if calls else None
     def execute(self, call: ToolCall) -> ToolExecutionResult:
+        validated_call, failure = self.validate_call(call)
+        if failure is not None:
+            return failure
+        return self.execute_validated(validated_call)
+
+    def validate_call(self, call: ToolCall) -> tuple[ToolCall | None, ToolExecutionResult | None]:
+        """Validate and normalize without executing the registered function."""
         definition = self.registry.get(call.name)
-        if definition is None: return self._failure(call, "unknown_tool", f"Unknown tool: {call.name}")
+        if definition is None:
+            return None, self._failure(call, "unknown_tool", f"Unknown tool: {call.name}")
         try:
             arguments = self._validate(definition.parameters, call.arguments, "arguments")
             arguments = self._normalize_arguments(call.name, arguments)
+            return ToolCall(call.name, arguments, call.call_id), None
+        except ToolValidationError as exc:
+            return None, self._failure(call, "validation_error", str(exc))
+        except ToolError as exc:
+            return None, self._failure(call, exc.code, exc.message, exc.details)
+        except (ValueError, TypeError, OSError) as exc:
+            return None, self._failure(call, "validation_error", str(exc)[:500])
+
+    def execute_validated(self, call: ToolCall) -> ToolExecutionResult:
+        """Execute a call returned by ``validate_call``."""
+        definition = self.registry.get(call.name)
+        if definition is None:
+            return self._failure(call, "unknown_tool", f"Unknown tool: {call.name}")
+        arguments = call.arguments
+        try:
             data = definition.function(**arguments)
             if not isinstance(data, dict): data = {"value": data}
             data = self._json_safe(data)
             data = self._bound_data(data)
             return ToolExecutionResult(call, True, data=data, meta={}, validated_arguments=arguments)
-        except ToolValidationError as exc: return self._failure(call, "validation_error", str(exc))
         except ToolError as exc: return self._failure(call, exc.code, exc.message, exc.details, arguments)
         except (ValueError, TypeError, OSError) as exc: return self._failure(call, "execution_error", str(exc)[:500], validated_arguments=arguments)
         except Exception:

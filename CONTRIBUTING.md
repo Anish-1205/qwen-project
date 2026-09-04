@@ -20,7 +20,11 @@ suite download or initialize Qwen.
 
 ## Change guidelines
 
-- Keep `ConversationOrchestrator` shared by all three entry points.
+- Keep `HarnessRunner` shared by all three entry points and model-independent.
+- Keep model loading, tokenization, device placement, and generation inside a
+  `ModelBackend`; do not add backend- or model-specific behavior to `harness/`.
+- Keep tool-selection models behind `ToolSelector`; turn-level retry, duplicate,
+  budget, and termination policy belongs in `HarnessRunner`.
 - Treat model-produced tool names and arguments as untrusted input.
 - Add executable tools through the registry and include validation and tests.
 - Keep production tools stateless; they must not write memory or session data.
@@ -37,7 +41,7 @@ suite download or initialize Qwen.
 Run focused tests while developing, followed by the complete suite:
 
 ```powershell
-python -m pytest tests/test_tools.py
+python -m pytest tests/test_harness.py tests/test_tools.py
 python -m pytest
 ```
 

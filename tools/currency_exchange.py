@@ -26,7 +26,7 @@ def _currency_code(value: str, field: str) -> str:
 
 
 def _requested_date(value: str | None) -> str | None:
-    if value is None:
+    if value is None or value == "":
         return None
     try:
         parsed = calendar_date.fromisoformat(value)

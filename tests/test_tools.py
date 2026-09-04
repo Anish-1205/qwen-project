@@ -5,9 +5,10 @@ import unittest
 from unittest.mock import patch
 
 from intent_classifier import IntentDecision
-from orchestrator import ConversationOrchestrator, DEFAULT_SYSTEM_PROMPT
+from harness import ConversationOrchestrator, DEFAULT_SYSTEM_PROMPT
 from tools import ToolCall, ToolManager, calculator
 from tools.registry import ToolDefinition, ToolRegistry
+from tests.test_intent_and_orchestration import StubBackend
 
 
 class FakeTokenizer:
@@ -111,8 +112,7 @@ class ToolManagerTests(unittest.TestCase):
 class ToolOrchestrationTests(unittest.TestCase):
     def _orchestrator(self, generated, *, tool_manager=None):
         return QueueOrchestrator(
-            FakeTokenizer(),
-            object(),
+            StubBackend(),
             FakeMemory(),
             generated=generated,
             intent_classifier=StaticClassifier(),

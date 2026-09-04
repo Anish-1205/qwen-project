@@ -7,7 +7,7 @@ import pytest
 import requests
 
 from intent_classifier import DeterministicIntentRouter
-from orchestrator import (
+from harness import (
     ConversationOrchestrator,
     DEFAULT_SYSTEM_PROMPT,
     SEARCH_CONFIGURATION_REQUIRED_RESPONSE,
@@ -15,6 +15,7 @@ from orchestrator import (
 from tools import ToolCall, ToolDefinition, ToolManager, ToolRegistry
 from tools.common import ToolError
 from tools.web_search import TAVILY_SEARCH_URL, search_web
+from tests.test_intent_and_orchestration import FakeMemory, StubBackend
 
 
 class FakeResponse:
@@ -41,7 +42,7 @@ class QueueOrchestrator(ConversationOrchestrator):
         self.inputs = []
         self.overrides = []
         super().__init__(
-            object(), object(), object(), tool_manager=tool_manager,
+            StubBackend(), FakeMemory(), tool_manager=tool_manager,
             logger=logger or (lambda message: None),
         )
 
@@ -201,6 +202,35 @@ def test_search_web_execution_supplies_structured_results_for_grounding():
     assert len(payload["data"]["results"]) == 2
 
 
+def test_explicit_search_bypasses_model_tool_selection():
+    logs = []
+    orchestrator = QueueOrchestrator(
+        ["The returned sources describe Python 3.14 changes."],
+        logger=logs.append,
+    )
+
+    with patch.dict("os.environ", {"TAVILY_API_KEY": "configured"}, clear=False), patch(
+        "tools.web_search.requests.post", return_value=FakeResponse(_search_payload(2))
+    ):
+        reply = orchestrator.generate_tool_aware_reply(
+            [{"role": "user", "content": "Search the web for Python 3.14 changes."}],
+            turn_number=7,
+        )
+
+    assert reply == "The returned sources describe Python 3.14 changes."
+    assert orchestrator.last_tool_execution.ok
+    assert orchestrator.last_tool_execution.call.name == "search_web"
+    assert orchestrator.last_tool_execution.call.arguments["query"] == (
+        "Search the web for Python 3.14 changes."
+    )
+    # The only model generation is final synthesis after the deterministic call.
+    assert len(orchestrator.inputs) == 1
+    assert any(
+        "source=deterministic tool=search_web reason=explicit_web_search_request" in message
+        for message in logs
+    )
+
+
 def test_missing_key_returns_explicit_configuration_failure_without_model_completion():
     call = '<tool_call>{"name":"search_web","arguments":{"query":"latest Python release"}}</tool_call>'
     orchestrator = QueueOrchestrator([call, "Invented search results."])
@@ -212,7 +242,7 @@ def test_missing_key_returns_explicit_configuration_failure_without_model_comple
         )
 
     assert reply == SEARCH_CONFIGURATION_REQUIRED_RESPONSE
-    assert len(orchestrator.inputs) == 1
+    assert orchestrator.inputs == []
     assert orchestrator.last_tool_execution.error_details["code"] == "missing_api_key"
 
 
@@ -262,9 +292,11 @@ def test_fetch_webpage_cannot_satisfy_a_required_search_action():
     )
 
     assert "no valid registered tool execution" in reply
-    assert [result.call.name for result in orchestrator.last_tool_executions] == ["fetch_webpage"]
-    assert not orchestrator.last_tool_executions[0].ok
-    assert orchestrator.last_tool_executions[0].error_details["code"] == "url_not_in_current_turn"
+    assert [result.call.name for result in orchestrator.last_tool_executions] == [
+        "search_web", "fetch_webpage",
+    ]
+    assert orchestrator.last_tool_executions[0].ok
+    assert orchestrator.last_tool_executions[1].error_details["code"] == "url_not_in_current_turn"
     assert "fetch_webpage" not in {
         schema["function"]["name"] for schema in orchestrator.overrides[0]["tools"]
     }

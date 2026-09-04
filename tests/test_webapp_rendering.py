@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from webapp import _message_to_response, _render_assistant_markdown
+from webapp import _format_trace_html, _message_to_response, _render_assistant_markdown
 
 
 def test_renders_standard_assistant_markdown():
@@ -48,3 +48,12 @@ def test_only_assistant_response_gets_additive_rendered_content():
     assert assistant["rendered_content"] == "<p><strong>bold</strong></p>\n"
     assert "rendered_content" not in user
     assert user["content"] == "**literal**"
+
+
+def test_web_ui_includes_runtime_model_selector():
+    html = _format_trace_html("test-session")
+
+    assert 'id="model-select"' in html
+    assert 'id="tool-selector"' in html
+    assert "'/api/models'" in html
+    assert "'/api/models/select'" in html

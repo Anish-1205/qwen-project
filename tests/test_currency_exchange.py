@@ -8,9 +8,10 @@ import pytest
 import requests
 
 from intent_classifier import DeterministicIntentRouter
-from orchestrator import ConversationOrchestrator, DEFAULT_SYSTEM_PROMPT
+from harness import ConversationOrchestrator, DEFAULT_SYSTEM_PROMPT
 from tools import ToolCall, ToolManager
 from tools.currency_exchange import FRANKFURTER_RATE_URL, currency_exchange
+from tests.test_intent_and_orchestration import FakeMemory, StubBackend
 
 
 class FakeResponse:
@@ -35,7 +36,7 @@ class QueueOrchestrator(ConversationOrchestrator):
     def __init__(self, generated):
         self.generated = list(generated)
         self.inputs = []
-        super().__init__(object(), object(), object(), logger=lambda message: None)
+        super().__init__(StubBackend(), FakeMemory(), logger=lambda message: None)
 
     def generate_reply(self, messages, **overrides):
         self.inputs.append([dict(message) for message in messages])
@@ -87,6 +88,23 @@ def test_currency_exchange_rate_only_uses_latest_provider_date():
     assert result["rate"] == "83.125"
     assert result["rate_date"] == "2026-08-20"
     assert "amount" not in result and "converted_amount" not in result
+    assert get.call_args.kwargs["params"] is None
+
+
+def test_currency_exchange_accepts_empty_optional_date_as_latest():
+    response = FakeResponse(_rate_payload(rate=0.8))
+    manager = ToolManager()
+
+    with patch("tools.currency_exchange.requests.get", return_value=response) as get:
+        result = manager.execute(ToolCall("currency_exchange", {
+            "base_currency": "USD",
+            "quote_currency": "EUR",
+            "amount": 100,
+            "date": "",
+        }))
+
+    assert result.ok
+    assert result.validated_arguments["date"] == ""
     assert get.call_args.kwargs["params"] is None
 
 

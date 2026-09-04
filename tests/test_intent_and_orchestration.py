@@ -2,8 +2,15 @@ from __future__ import annotations
 
 import unittest
 
-from intent_classifier import DeterministicIntentRouter, IntentClassifier, IntentDecision
-from orchestrator import ConversationOrchestrator, DEFAULT_SYSTEM_PROMPT, DocumentRetrievalResult
+from intent_classifier import ConfidenceTier, DeterministicIntentRouter, IntentClassifier, IntentDecision
+from harness import (
+    ConversationOrchestrator,
+    DEFAULT_SYSTEM_PROMPT,
+    DocumentRetrievalResult,
+    OrchestrationOutcome,
+)
+from tools import ToolDefinition, ToolManager, ToolRegistry
+from models import GenerationResult, ModelBackend, ModelCapabilities, ModelSpec
 
 
 class FakeTokenizer:
@@ -14,6 +21,27 @@ class FakeTokenizer:
 
     def __call__(self, prompt, *args, **kwargs):
         return {"input_ids": list(range(len(str(prompt).split())))}
+
+
+class StubBackend(ModelBackend):
+    def __init__(self, model_name="test/stub"):
+        self._spec = ModelSpec(
+            "stub", "Stub", model_name, "test",
+            ModelCapabilities(tool_schemas=True, tool_messages=True),
+        )
+
+    @property
+    def spec(self):
+        return self._spec
+
+    def load(self):
+        pass
+
+    def generate(self, request):
+        raise AssertionError("unexpected backend generation")
+
+    def count_tokens(self, messages):
+        return sum(len(str(message.get("content", "")).split()) for message in messages)
 
 
 class FakeMemory:
@@ -57,10 +85,24 @@ class StaticClassifier:
         return self.decision
 
 
+class QueueNeedleSelector:
+    def __init__(self, outputs):
+        self.outputs = list(outputs)
+        self.calls = []
+
+    def select(self, messages, *, schemas):
+        self.calls.append((list(messages), list(schemas)))
+        return self.outputs.pop(0)
+
+
 class QueueOrchestrator(ConversationOrchestrator):
     def __init__(self, *args, generated=None, **kwargs):
         self.generated = list(generated or [])
         self.generation_inputs = []
+        if args and not isinstance(args[0], ModelBackend):
+            if len(args) < 3:
+                raise TypeError("legacy test construction requires tokenizer, model, and memory")
+            args = (StubBackend(), args[2], *args[3:])
         super().__init__(*args, **kwargs)
 
     def generate_reply(self, messages, **overrides):
@@ -231,6 +273,19 @@ class DeterministicIntentRouterTests(unittest.TestCase):
         self.assertEqual(decision, IntentDecision(False, False, True, False))
         self.assertEqual(len(classifier.calls), 1)
 
+    def test_confidence_is_high_for_rules_and_medium_for_semantic_escalation(self):
+        high = self.router.analyze("What is my name?", [])
+        medium = self.router.analyze("What is the significance of the Antikythera mechanism?", [])
+
+        self.assertEqual(high.confidence_for("memory_read"), ConfidenceTier.HIGH)
+        self.assertEqual(medium.confidence_for("document_read"), ConfidenceTier.MEDIUM)
+
+    def test_missing_action_target_is_very_low_confidence(self):
+        evidence = self.router.analyze("Read that link.", [])
+
+        self.assertIsNone(evidence.tool_use)
+        self.assertEqual(evidence.confidence_for("tool_use"), ConfidenceTier.VERY_LOW)
+
     def test_changed_from_programming_assertions_route_to_memory_write(self):
         assertions = [
             "My programming language changed from Java to Go.",
@@ -255,6 +310,77 @@ class DeterministicIntentRouterTests(unittest.TestCase):
             (unrelated.memory_read, unrelated.memory_write, unrelated.document_read, unrelated.general_chat),
             (False, False, False, True),
         )
+
+    def test_current_assertion_outranks_deictic_memory_suffix(self):
+        assertions = [
+            "I've started coding mostly in Rust lately. Remember that.",
+            "I've started coding mostly in Rust lately.",
+            "I code mostly in TypeScript now.",
+            "I switched from Python to Rust for programming.",
+            "I live in Pune now. Remember that.",
+            "My preferred language is Go now. Save that.",
+        ]
+
+        for assertion in assertions:
+            with self.subTest(assertion=assertion):
+                evidence = self.router.analyze(assertion, [])
+                self.assertTrue(evidence.memory_write)
+                self.assertEqual(evidence.confidence_for("memory_write"), ConfidenceTier.HIGH)
+                self.assertEqual(evidence.source_for("memory_write"), "deterministic")
+                self.assertFalse(self.router.is_contextual_memory_command(assertion))
+
+    def test_assertion_free_deictic_memory_command_resolves_prior_fact(self):
+        history = [
+            {"role": "user", "content": "I prefer tea."},
+            {"role": "assistant", "content": "Understood."},
+        ]
+
+        evidence = self.router.analyze("Remember that.", history)
+
+        self.assertTrue(evidence.memory_write)
+        self.assertEqual(evidence.confidence_for("memory_write"), ConfidenceTier.HIGH)
+        self.assertEqual(evidence.source_for("memory_write"), "contextual_deterministic")
+        self.assertEqual(self.router.resolve_memory_write_source("Remember that.", history), "I prefer tea.")
+
+    def test_mixed_assertion_and_same_turn_weather_reference_route_independently(self):
+        cases = [
+            ("I moved to Bangalore recently, and can you also check the weather there?", True, "Bangalore"),
+            ("I live in Pune now. What's the weather there?", True, "Pune"),
+            ("I'm visiting Tokyo tomorrow; check the weather there.", False, "Tokyo"),
+            ("I moved to Bangalore recently.", True, None),
+        ]
+
+        for message, memory_write, location in cases:
+            with self.subTest(message=message):
+                evidence = self.router.analyze(message, [])
+                self.assertFalse(evidence.memory_read)
+                self.assertEqual(evidence.memory_write, memory_write)
+                self.assertEqual(evidence.tool_use, location is not None)
+                self.assertEqual(self.router.resolve_weather_reference(message, []), location)
+                if memory_write:
+                    self.assertEqual(evidence.confidence_for("memory_write"), ConfidenceTier.HIGH)
+                if location:
+                    self.assertEqual(evidence.confidence_for("tool_use"), ConfidenceTier.HIGH)
+
+    def test_unresolved_weather_reference_is_very_low_confidence(self):
+        evidence = self.router.analyze("Can you check the weather there?", [])
+
+        self.assertIsNone(evidence.tool_use)
+        self.assertEqual(evidence.confidence_for("tool_use"), ConfidenceTier.VERY_LOW)
+
+    def test_lowercase_explicit_weather_locations_are_resolved_deterministically(self):
+        cases = {
+            "hows the weather in bengaluru ?": "Bengaluru",
+            "what is the weather in kolkata": "Kolkata",
+            "weather in new york right now": "New York",
+        }
+
+        for prompt, place in cases.items():
+            with self.subTest(prompt=prompt):
+                evidence = self.router.analyze(prompt, [])
+                self.assertTrue(evidence.tool_use)
+                self.assertEqual(evidence.confidence_for("tool_use"), ConfidenceTier.HIGH)
+                self.assertEqual(self.router.resolve_weather_reference(prompt, []), place)
 
     def test_implicit_organization_knowledge_questions_route_to_documents(self):
         queries = [
@@ -406,6 +532,184 @@ class OrchestrationRoutingTests(unittest.TestCase):
         self.assertEqual(memory.read_calls, ["What about that?"])
         self.assertEqual(memory.router_calls, [])
         self.assertEqual(documents, ["What about that?"])
+
+    def test_risky_very_low_route_asks_before_any_side_effect(self):
+        memory = FakeMemory()
+        document_calls = []
+        orchestrator = QueueOrchestrator(
+            FakeTokenizer(),
+            object(),
+            memory,
+            generated=[],
+            intent_classifier=StaticClassifier(IntentDecision(False, True, False, False)),
+            document_lookup=lambda query: document_calls.append(query) or DocumentRetrievalResult(),
+            logger=lambda message: None,
+        )
+
+        _, reply, memory_context, _ = orchestrator.process_turn(
+            "Update your knowledge accordingly.",
+            [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}],
+            turn_number=1,
+        )
+
+        self.assertEqual(orchestrator.last_routing_decision.outcome, OrchestrationOutcome.ASK_USER)
+        self.assertIn("what specific information", reply.lower())
+        self.assertEqual(memory_context, "")
+        self.assertFalse(memory.read_calls)
+        self.assertFalse(memory.router_calls)
+        self.assertFalse(document_calls)
+        self.assertFalse(orchestrator.last_tool_executions)
+
+    def test_inline_durable_assertion_never_reaches_semantic_router_or_clarification(self):
+        classifier = StaticClassifier(IntentDecision(False, False, False, True))
+        orchestrator = QueueOrchestrator(
+            FakeTokenizer(),
+            object(),
+            FakeMemory(),
+            generated=["Noted.", "None"],
+            intent_classifier=classifier,
+            logger=lambda message: None,
+        )
+
+        _, reply, _, _ = orchestrator.process_turn(
+            "I've started coding mostly in Rust lately. Remember that.",
+            [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}],
+            turn_number=1,
+        )
+
+        self.assertEqual(reply, "Noted.")
+        self.assertEqual(classifier.calls, [])
+        self.assertEqual(orchestrator.last_routing_decision.outcome, OrchestrationOutcome.ACT)
+        write_evidence = orchestrator.last_routing_decision.evidence_for("memory_write")
+        self.assertTrue(write_evidence.value)
+        self.assertEqual(write_evidence.confidence, ConfidenceTier.HIGH)
+        self.assertEqual(write_evidence.source, "deterministic")
+
+    def test_same_turn_location_is_forced_into_weather_tool_arguments(self):
+        observed_places = []
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                "weather",
+                "Get weather.",
+                lambda place: observed_places.append(place) or {"location": place},
+                {
+                    "type": "object",
+                    "properties": {"place": {"type": "string", "minLength": 1}},
+                    "required": ["place"],
+                    "additionalProperties": False,
+                },
+            )
+        )
+        needle = QueueNeedleSelector(["[]"])
+        classifier = StaticClassifier(IntentDecision(True, False, False, True))
+        orchestrator = QueueOrchestrator(
+            FakeTokenizer(),
+            object(),
+            FakeMemory(),
+            generated=["Bangalore weather returned.", "None"],
+            intent_classifier=classifier,
+            needle_selector=needle,
+            tool_manager=ToolManager(registry),
+            logger=lambda message: None,
+        )
+
+        _, reply, _, _ = orchestrator.process_turn(
+            "I moved to Bangalore recently, and can you also check the weather there?",
+            [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}],
+            turn_number=1,
+        )
+
+        self.assertEqual(reply, "Bangalore weather returned.")
+        self.assertEqual(classifier.calls, [])
+        self.assertEqual(observed_places, ["Bangalore"])
+        self.assertEqual(orchestrator.last_tool_execution.validated_arguments, {"place": "Bangalore"})
+        self.assertEqual(orchestrator.last_routing_decision.outcome, OrchestrationOutcome.SELECT_TOOL)
+        self.assertEqual(len(needle.calls), 1)
+
+    def test_explicit_weather_location_bypasses_failed_initial_model_selection(self):
+        observed_places = []
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                "weather",
+                "Get weather.",
+                lambda place: observed_places.append(place) or {"location": place},
+                {
+                    "type": "object",
+                    "properties": {"place": {"type": "string", "minLength": 1}},
+                    "required": ["place"],
+                    "additionalProperties": False,
+                },
+            )
+        )
+        needle = QueueNeedleSelector(["No additional tool call is needed."])
+        orchestrator = QueueOrchestrator(
+            FakeTokenizer(),
+            object(),
+            FakeMemory(),
+            generated=["It is clear in Bangalore."],
+            needle_selector=needle,
+            tool_manager=ToolManager(registry),
+            logger=lambda message: None,
+        )
+
+        _, reply, _, _ = orchestrator.process_turn(
+            "Check the weather in Bangalore.",
+            [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}],
+            turn_number=1,
+        )
+
+        self.assertEqual(reply, "It is clear in Bangalore.")
+        self.assertEqual(observed_places, ["Bangalore"])
+        self.assertEqual(len(needle.calls), 1)
+
+    def test_unresolved_weather_location_clarifies_without_tool_execution(self):
+        orchestrator = QueueOrchestrator(
+            FakeTokenizer(),
+            object(),
+            FakeMemory(),
+            generated=[],
+            intent_classifier=StaticClassifier(IntentDecision(False, False, False, True, True)),
+            logger=lambda message: None,
+        )
+
+        _, reply, _, _ = orchestrator.process_turn(
+            "Can you check the weather there?",
+            [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}],
+            turn_number=1,
+        )
+
+        self.assertEqual(orchestrator.last_routing_decision.outcome, OrchestrationOutcome.ASK_USER)
+        self.assertIn("location", reply.lower())
+        self.assertFalse(orchestrator.last_tool_executions)
+
+    def test_injected_needle_selects_tool_and_main_model_synthesizes(self):
+        needle = QueueNeedleSelector([
+            '<tool_call>{"name":"calculator","arguments":{"expression":"2 + 2"}}</tool_call>',
+            "[]",
+        ])
+        orchestrator = QueueOrchestrator(
+            FakeTokenizer(),
+            object(),
+            FakeMemory(),
+            generated=["The result is 4."],
+            needle_selector=needle,
+            logger=lambda message: None,
+        )
+
+        reply = orchestrator.generate_tool_aware_reply(
+            [
+                {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
+                {"role": "user", "content": "Calculate 2 + 2."},
+            ],
+            turn_number=1,
+        )
+
+        self.assertEqual(reply, "The result is 4.")
+        self.assertEqual(len(needle.calls), 2)
+        self.assertTrue(orchestrator.last_tool_execution.ok)
+        self.assertEqual(orchestrator.routing_metrics["needle_selections"], 2)
 
     def test_document_context_is_trimmed_to_configured_budget(self):
         blocks = [f"Source: file{index}.txt, lines 1-2\n" + ("word " * 55) for index in range(3)]

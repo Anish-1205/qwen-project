@@ -1,6 +1,7 @@
 """Run the stateless terminal interface for one-turn-at-a-time inference."""
 
 import logging
+import os
 import sys
 import warnings
 
@@ -13,16 +14,13 @@ from huggingface_hub.utils import logging as hf_logging
 
 hf_logging.set_verbosity_error()
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-
 from documents import DocumentIndex
+from harness import DEFAULT_SYSTEM_PROMPT, HarnessRunner, RunRequest
 from logging_utils import assistant_label, capture_prints, dim_text, launch_log_tailer, prompt_text, setup_debug_logger, status_text, turn_status_text
 from memory_core import OfflineMemoryManager as BaseOfflineMemoryManager
-from orchestrator import ConversationOrchestrator, DEFAULT_SYSTEM_PROMPT, strip_speaker_tags
-
-MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
-
+from models import create_backend, get_model_spec
+from harness import strip_speaker_tags
+from tool_selectors import configured_tool_selector
 
 class OfflineMemoryManager(BaseOfflineMemoryManager):
     pass
@@ -33,36 +31,25 @@ def postprocess_reply(text: str) -> str:
 
 
 def main():
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-    )
-
     logger, log_path = setup_debug_logger()
     if not launch_log_tailer(log_path, logger):
         print(status_text(f"[Status] Debug log: {log_path}"))
 
     with capture_prints(logger):
-        logger.info("Loading Qwen2.5-3B-Instruct model in 4-bit NF4...")
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_ID,
-            quantization_config=bnb_config,
-            device_map="auto",
-        )
-        model.eval()
+        logger.info("Loading configured model...")
+        model_selection = os.environ.get("CHATBOT_MODEL", "qwen").strip().lower()
+        model_backend = create_backend(get_model_spec(model_selection))
+        model_backend.load()
         logger.info("Model loading complete.")
 
         memory = OfflineMemoryManager()
         document_index = DocumentIndex(memory.embed_model, logger=logger)
         document_index.sync()
+        tool_selector = configured_tool_selector(logger=logger.info)
 
     messages = [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}]
-    orchestrator = ConversationOrchestrator(
-        tokenizer,
-        model,
+    orchestrator = HarnessRunner(
+        model_backend,
         memory,
         system_prompt=DEFAULT_SYSTEM_PROMPT,
         compression_enabled=False,
@@ -77,6 +64,7 @@ def main():
             "do_sample": False,
         },
         document_lookup=document_index.lookup_context,
+        tool_selector=tool_selector,
         logger=logger.info,
     )
 
@@ -93,13 +81,14 @@ def main():
 
             turn_number += 1
             with capture_prints(logger):
-                messages, reply, _, _ = orchestrator.process_turn(
-                    user_input,
-                    messages,
+                result = orchestrator.run(RunRequest(
+                    user_input=user_input,
+                    messages=messages,
                     turn_number=turn_number,
                     maintain_history=False,
                     reply_postprocess=postprocess_reply,
-                )
+                ))
+                messages, reply = result.messages, result.output
 
             print(f"{assistant_label('Assistant:')} {reply}")
             print(turn_status_text(f"[Turn {turn_number}] done."))
@@ -111,6 +100,8 @@ def main():
             break
         except Exception as e:
             print(f"\n{status_text(f'Error: {e}')}\n", file=sys.stderr)
+
+    model_backend.close()
 
 
 if __name__ == "__main__":

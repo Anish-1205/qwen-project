@@ -6,15 +6,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config
-from .common import ToolError
+from .common import ToolError, resolve_local_path
 
 
 def list_directory(path: str, recursive: bool = False, max_depth: int = 1,
                    extensions: list[str] | None = None, pattern: str | None = None) -> dict:
-    root = Path(path).expanduser()
-    if not root.is_absolute():
-        root = Path.cwd() / root
-    root = root.resolve()
+    root = resolve_local_path(path)
     if not root.exists():
         raise ToolError("path_not_found", "The requested directory does not exist.", {"path": str(root)})
     if not root.is_dir():

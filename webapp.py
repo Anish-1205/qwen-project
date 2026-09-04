@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sqlite3
 import threading
 import uuid
@@ -28,23 +29,24 @@ from huggingface_hub.utils import logging as hf_logging
 from markdown_it import MarkdownIt
 import nh3
 from pydantic import BaseModel, Field
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-
 from app_paths import CHAT_SESSIONS_DB_PATH
 from documents import DocumentIndex
 from documents.db import open_db as open_documents_db
+from harness import DEFAULT_SYSTEM_PROMPT, HarnessRunner, RunRequest
 from logging_utils import capture_prints, launch_log_tailer, setup_debug_logger
 from memory_core import OfflineMemoryManager
-from orchestrator import ConversationOrchestrator, DEFAULT_SYSTEM_PROMPT, strip_speaker_tags
+from models import MODEL_REGISTRY, ModelBackend, create_backend, get_model_spec
+from harness import strip_speaker_tags
+from tool_selectors import configured_tool_selector
 
 hf_logging.set_verbosity_error()
 
-MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
 SESSION_COOKIE = "roots_chat_session"
 APP_TITLE = "Roots Chat"
 DEFAULT_SESSION_TITLE = "New Chat"
 SESSION_TITLE_MAX_LENGTH = 48
+DOCUMENT_UPLOAD_MAX_BYTES = 10_000_000
+DOCUMENT_UPLOAD_EXTENSIONS = {".pdf", ".txt"}
 
 MARKDOWN_RENDERER = MarkdownIt("commonmark", {"html": False, "linkify": False, "typographer": False})
 MARKDOWN_ALLOWED_TAGS = {
@@ -58,6 +60,10 @@ MARKDOWN_ALLOWED_URL_SCHEMES = {"http", "https", "mailto"}
 class ChatRequest(BaseModel):
   message: str = Field(min_length=1, max_length=20000)
   session_id: str | None = None
+
+
+class ModelSelectionRequest(BaseModel):
+  model_id: str = Field(min_length=1, max_length=64)
 
 
 @dataclass
@@ -75,11 +81,13 @@ class AppState:
   error: str | None = None
   logger: logging.Logger | None = None
   log_path: Path | None = None
-  tokenizer: object | None = None
-  model: object | None = None
+  model_backend: ModelBackend | None = None
+  active_model_id: str | None = None
+  tool_selector: object | None = None
+  active_tool_selector_id: str = "main_model_fallback"
   memory: OfflineMemoryManager | None = None
   document_index: DocumentIndex | None = None
-  orchestrator: ConversationOrchestrator | None = None
+  orchestrator: HarnessRunner | None = None
   init_started: bool = False
   init_lock: threading.Lock = field(default_factory=threading.Lock)
   generation_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -401,8 +409,18 @@ def _save_uploaded_document(filename: str, content: bytes) -> Path:
   docs_root = _get_documents_root()
   docs_root.mkdir(parents=True, exist_ok=True)
   safe_name = Path(filename).name
+  if not safe_name or safe_name in {".", ".."}:
+    raise HTTPException(status_code=400, detail="Invalid filename")
+  if Path(safe_name).suffix.lower() not in DOCUMENT_UPLOAD_EXTENSIONS:
+    raise HTTPException(status_code=415, detail="Only .txt and .pdf documents are supported")
+  if len(content) > DOCUMENT_UPLOAD_MAX_BYTES:
+    raise HTTPException(status_code=413, detail="Document exceeds the upload size limit")
   target = docs_root / safe_name
-  target.write_bytes(content)
+  try:
+    with target.open("xb") as output:
+      output.write(content)
+  except FileExistsError as exc:
+    raise HTTPException(status_code=409, detail="A document with that filename already exists") from exc
   return target
 
 
@@ -454,19 +472,129 @@ def _activate_browser_session(session_id: str, response: Response | None = None)
 _init_chat_sessions_db()
 
 
-def _build_bnb_config() -> BitsAndBytesConfig:
-    return BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-    )
-
-
 def _set_state(**updates) -> None:
     with APP_STATE.init_lock:
         for key, value in updates.items():
             setattr(APP_STATE, key, value)
+
+
+def _configured_model_id() -> str:
+    model_id = os.environ.get("CHATBOT_MODEL", "qwen").strip().lower()
+    get_model_spec(model_id)
+    return model_id
+
+
+def _release_model_backend(backend: ModelBackend | None) -> None:
+    if backend is not None:
+        backend.close()
+
+
+def _available_models_payload() -> dict:
+    with APP_STATE.init_lock:
+        active_model_id = APP_STATE.active_model_id
+        active_tool_selector_id = APP_STATE.active_tool_selector_id
+    return {
+        "models": [
+            {
+                "id": spec.id,
+                "display_name": spec.display_name,
+                "model_name": spec.model_name,
+                "active": spec.id == active_model_id,
+            }
+            for spec in MODEL_REGISTRY.values()
+        ],
+        "active_model_id": active_model_id,
+        "active_tool_selector_id": active_tool_selector_id,
+    }
+
+
+def _switch_model(model_id: str) -> dict:
+    target = get_model_spec(model_id.strip().lower())
+    switch_logger = APP_STATE.logger
+    with APP_STATE.generation_lock:
+        already_active = False
+        with APP_STATE.init_lock:
+            if APP_STATE.status != "ready" or APP_STATE.orchestrator is None:
+                raise RuntimeError("Application is not ready for model switching")
+            if APP_STATE.active_model_id == target.id:
+                already_active = True
+            else:
+                previous_id = APP_STATE.active_model_id
+                previous_backend = APP_STATE.model_backend
+                orchestrator = APP_STATE.orchestrator
+                APP_STATE.status = "loading_model"
+                APP_STATE.detail = f"Loading {target.display_name}."
+                APP_STATE.error = None
+                APP_STATE.model_backend = None
+                orchestrator.model_backend = None
+
+        if already_active:
+            if switch_logger is not None:
+                switch_logger.info(
+                f"[Model Switch] outcome=unchanged model_id={target.id} "
+                f"model={target.model_name} selector={APP_STATE.active_tool_selector_id}"
+                )
+            return _available_models_payload()
+
+        if switch_logger is not None:
+            switch_logger.info(
+                f"[Model Switch] outcome=started from_model_id={previous_id or 'none'} "
+                f"to_model_id={target.id} model={target.model_name} "
+                f"selector={APP_STATE.active_tool_selector_id}"
+            )
+        _release_model_backend(previous_backend)
+        previous_backend = None
+        new_backend = None
+        try:
+            new_backend = create_backend(target)
+            new_backend.load()
+        except Exception as load_error:
+            import traceback
+
+            traceback.clear_frames(load_error.__traceback__)
+            _release_model_backend(new_backend)
+            restore_error = None
+            restored_backend = None
+            if previous_id in MODEL_REGISTRY:
+                try:
+                    restored_backend = create_backend(MODEL_REGISTRY[previous_id])
+                    restored_backend.load()
+                except Exception as exc:  # pragma: no cover - exceptional double failure
+                    restore_error = exc
+            with APP_STATE.init_lock:
+                APP_STATE.model_backend = restored_backend
+                orchestrator.model_backend = restored_backend
+                APP_STATE.active_model_id = previous_id if restored_backend is not None else None
+                APP_STATE.status = "ready" if restored_backend is not None else "failed"
+                APP_STATE.detail = "Previous model restored." if restored_backend is not None else "Model switch and restore failed."
+                APP_STATE.error = str(load_error)
+            if switch_logger is not None:
+                switch_logger.error(
+                    f"[Model Switch] outcome=failed to_model_id={target.id} "
+                    f"error_type={type(load_error).__name__} "
+                    f"restored_model_id={previous_id if restored_backend is not None else 'none'}"
+                )
+            if restore_error is not None:
+                raise RuntimeError(
+                    f"Could not load {target.display_name}; restoring the previous model also failed: {restore_error}"
+                ) from load_error
+            raise RuntimeError(f"Could not load {target.display_name}; the previous model was restored") from load_error
+
+        with APP_STATE.init_lock:
+            APP_STATE.model_backend = new_backend
+            orchestrator.model_backend = new_backend
+            APP_STATE.active_model_id = target.id
+            APP_STATE.status = "ready"
+            APP_STATE.detail = f"Ready with {target.display_name}."
+            APP_STATE.error = None
+        if switch_logger is not None:
+            switch_logger.info(
+                f"[Model Switch] outcome=ready from_model_id={previous_id or 'none'} "
+                f"to_model_id={target.id} model={target.model_name} backend={target.backend} "
+                f"policy={target.load_options.get('prompt_policy', 'native_tools')} "
+                f"selector={APP_STATE.active_tool_selector_id}"
+            )
+        return _available_models_payload()
 
 
 def _get_or_create_session_id(request: Request, response: Response) -> str:
@@ -538,24 +666,19 @@ def _initialize_app() -> None:
 
     try:
         with capture_prints(logger):
-            logger.info("Loading Qwen2.5-3B-Instruct model in 4-bit NF4...")
-            tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-            model = AutoModelForCausalLM.from_pretrained(
-                MODEL_ID,
-                quantization_config=_build_bnb_config(),
-                dtype="auto",
-                device_map="auto",
-            )
-            model.eval()
+            logger.info("Loading configured model...")
+            model_selection = _configured_model_id()
+            model_backend = create_backend(get_model_spec(model_selection))
+            model_backend.load()
             logger.info("Model loading complete.")
 
             memory = ReadOnlyOfflineMemoryManager()
             document_index = DocumentIndex(memory.embed_model, logger=logger)
             document_index.sync()
+            tool_selector = configured_tool_selector(logger=logger.info)
 
-        orchestrator = ConversationOrchestrator(
-            tokenizer,
-            model,
+        orchestrator = HarnessRunner(
+            model_backend,
             memory,
             system_prompt=DEFAULT_SYSTEM_PROMPT,
             compression_enabled=True,
@@ -570,12 +693,15 @@ def _initialize_app() -> None:
                 "do_sample": False,
             },
             document_lookup=document_index.lookup_context,
+            tool_selector=tool_selector,
             logger=logger.info,
         )
 
         _set_state(
-            tokenizer=tokenizer,
-            model=model,
+            model_backend=model_backend,
+            active_model_id=model_selection,
+            tool_selector=orchestrator.tool_selector,
+            active_tool_selector_id=orchestrator.tool_selector_identity,
             memory=memory,
             document_index=document_index,
             orchestrator=orchestrator,
@@ -595,6 +721,8 @@ def _get_state_snapshot() -> dict:
             "detail": APP_STATE.detail,
             "error": APP_STATE.error,
             "log_path": str(APP_STATE.log_path) if APP_STATE.log_path else None,
+            "active_model_id": APP_STATE.active_model_id,
+            "active_tool_selector_id": APP_STATE.active_tool_selector_id,
         }
 
 
@@ -921,6 +1049,19 @@ def _format_trace_html(initial_session_id: str) -> str:
     }
 
     .kv strong { color: var(--text); font-weight: 600; }
+
+    .model-select {
+      width: 100%;
+      margin-top: 6px;
+      padding: 9px 10px;
+      border: 1px solid rgba(255,255,255,0.10);
+      border-radius: 10px;
+      background: var(--bg2);
+      color: var(--text);
+      font: inherit;
+    }
+
+    .model-select:disabled { opacity: 0.6; cursor: wait; }
 
     .kv div,
     .trace-item,
@@ -1562,6 +1703,10 @@ def _format_trace_html(initial_session_id: str) -> str:
           <div class="badge" id="runtime-badge"><span class="dot"></span><span id="runtime-status">initializing</span></div>
         </div>
         <div class="kv">
+          <div><label for="model-select"><strong>Active model</strong></label><br>
+            <select class="model-select" id="model-select" disabled><option>Loading models...</option></select>
+          </div>
+          <div><strong>Tool selector</strong><br><span id="tool-selector">loading</span></div>
           <div><strong>Detail</strong><br><span id="runtime-detail">Loading components.</span></div>
           <div><strong>Session</strong><br><span id="session-id">waiting for session</span></div>
           <div><strong>Debug log</strong><br><span id="log-path">not available yet</span></div>
@@ -1617,6 +1762,8 @@ def _format_trace_html(initial_session_id: str) -> str:
     const runtimeStatus = document.getElementById('runtime-status');
     const runtimeDetail = document.getElementById('runtime-detail');
     const runtimeBadge = document.getElementById('runtime-badge');
+    const modelSelect = document.getElementById('model-select');
+    const toolSelectorLabel = document.getElementById('tool-selector');
     const statusText = document.getElementById('status-text');
     const sessionIdLabel = document.getElementById('session-id');
     const logPath = document.getElementById('log-path');
@@ -1643,6 +1790,7 @@ def _format_trace_html(initial_session_id: str) -> str:
     let autoScrollPinned = true;
     let healthTimer = null;
     let documentBusy = false;
+    let modelSwitching = false;
     let leftCollapsed = localStorage.getItem(STORAGE_KEYS.leftCollapsed) === '1';
     let rightCollapsed = localStorage.getItem(STORAGE_KEYS.rightCollapsed) === '1';
 
@@ -2041,6 +2189,7 @@ def _format_trace_html(initial_session_id: str) -> str:
         runtimeDetail.textContent = payload.detail || 'No detail provided.';
         statusText.textContent = payload.status === 'ready' ? 'Ready' : payload.status === 'failed' ? 'Failed' : 'Initializing...';
         logPath.textContent = payload.log_path || 'not available yet';
+        toolSelectorLabel.textContent = payload.active_tool_selector_id || 'main_model_fallback';
 
         runtimeBadge.style.borderColor = payload.status === 'ready' ? 'rgba(125, 227, 208, 0.28)' : payload.status === 'failed' ? 'rgba(245, 185, 113, 0.28)' : 'rgba(255,255,255,0.08)';
         runtimeBadge.querySelector('.dot').style.background = payload.status === 'ready' ? 'var(--accent)' : payload.status === 'failed' ? 'var(--accent-2)' : 'var(--accent-3)';
@@ -2049,6 +2198,7 @@ def _format_trace_html(initial_session_id: str) -> str:
         prompt.disabled = !ready;
         setGenerating(generating && ready);
         resetBtn.disabled = !ready;
+        modelSelect.disabled = !ready || modelSwitching;
         if (payload.status === 'failed') {
           appendMessage('system', `Startup failed: ${payload.error || 'unknown error'}`, { shouldScroll: false });
         }
@@ -2060,6 +2210,52 @@ def _format_trace_html(initial_session_id: str) -> str:
         prompt.disabled = true;
         setGenerating(false);
         resetBtn.disabled = true;
+        modelSelect.disabled = true;
+      }
+    }
+
+    async function refreshModels() {
+      const response = await fetch('/api/models', { cache: 'no-store' });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || 'Unable to load models');
+      modelSelect.innerHTML = '';
+      for (const model of payload.models || []) {
+        const option = document.createElement('option');
+        option.value = model.id;
+        option.textContent = model.display_name;
+        option.selected = model.id === payload.active_model_id;
+        modelSelect.appendChild(option);
+      }
+      modelSelect.dataset.activeModelId = payload.active_model_id || '';
+      modelSelect.disabled = !ready || modelSwitching;
+    }
+
+    async function switchModel(modelId) {
+      const previousModelId = modelSelect.dataset.activeModelId || '';
+      let switchError = '';
+      modelSwitching = true;
+      modelSelect.disabled = true;
+      prompt.disabled = true;
+      resetBtn.disabled = true;
+      runtimeDetail.textContent = 'Switching models...';
+      try {
+        const response = await fetch('/api/models/select', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model_id: modelId }),
+        });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.detail || 'Model switch failed');
+        modelSelect.dataset.activeModelId = payload.active_model_id || '';
+        await refreshModels();
+      } catch (error) {
+        modelSelect.value = previousModelId;
+        switchError = `Model switch failed: ${error}`;
+      } finally {
+        modelSwitching = false;
+        await updateHealth();
+        await refreshModels().catch(() => {});
+        if (switchError) runtimeDetail.textContent = switchError;
       }
     }
 
@@ -2142,6 +2338,9 @@ def _format_trace_html(initial_session_id: str) -> str:
       const [file] = documentFileInput.files || [];
       await uploadDocument(file);
     });
+    modelSelect.addEventListener('change', async () => {
+      await switchModel(modelSelect.value);
+    });
     collapseLeftBtn.addEventListener('click', () => {
       leftCollapsed = !leftCollapsed;
       setLayoutState();
@@ -2190,6 +2389,9 @@ def _format_trace_html(initial_session_id: str) -> str:
         setTraceEmpty(`Unable to load session history: ${error}`);
       }
       await updateHealth();
+      await refreshModels().catch((error) => {
+        runtimeDetail.textContent = `Unable to load models: ${error}`;
+      });
       if (healthTimer) {
         clearInterval(healthTimer);
       }
@@ -2209,9 +2411,35 @@ def startup_event() -> None:
     threading.Thread(target=_initialize_app, daemon=True).start()
 
 
+@app.on_event("shutdown")
+def shutdown_event() -> None:
+    with APP_STATE.generation_lock:
+        with APP_STATE.init_lock:
+            backend = APP_STATE.model_backend
+            APP_STATE.model_backend = None
+            if APP_STATE.orchestrator is not None:
+                APP_STATE.orchestrator.model_backend = None
+        _release_model_backend(backend)
+
+
 @app.get("/health")
 def health() -> dict:
     return _get_state_snapshot()
+
+
+@app.get("/api/models")
+def list_models() -> dict:
+    return _available_models_payload()
+
+
+@app.post("/api/models/select")
+def select_model(payload: ModelSelectionRequest) -> dict:
+    try:
+        return _switch_model(payload.model_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.get("/sessions")
@@ -2254,7 +2482,7 @@ async def upload_document(file: UploadFile = File(...)) -> dict:
     raise HTTPException(status_code=400, detail="Missing filename")
 
   try:
-    content = await file.read()
+    content = await file.read(DOCUMENT_UPLOAD_MAX_BYTES + 1)
     saved_path = _save_uploaded_document(file.filename, content)
     sync_summary = _sync_documents()
     return {
@@ -2352,14 +2580,18 @@ def _process_turn(session_id: str, session_state: SessionState, message: str) ->
         turn_number = session_state.turn_number
 
         with capture_prints(logger):
-            messages, reply, memory_context, document_result, retrieval_metadata = orchestrator.process_turn(
-                message,
-                session_state.messages,
+            result = orchestrator.run(RunRequest(
+                user_input=message,
+                messages=session_state.messages,
                 turn_number=turn_number,
                 maintain_history=True,
                 reply_postprocess=strip_speaker_tags,
-                include_retrieval_metadata=True,
-            )
+            ))
+            messages = result.messages
+            reply = result.output
+            memory_context = result.state.memory_context
+            document_result = result.state.document_result
+            retrieval_metadata = result.state.retrieval_metadata
 
         session_state.messages = messages
 
