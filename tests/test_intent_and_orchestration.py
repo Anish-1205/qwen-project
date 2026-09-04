@@ -57,6 +57,29 @@ class StaticClassifier:
         return self.decision
 
 
+class FakeNeedleAgent:
+    def __init__(self, responses):
+        self.responses = iter(responses)
+        self.queries = []
+        self.reset_calls = 0
+
+    def reset(self):
+        self.reset_calls += 1
+
+    def complete(self, query, **kwargs):
+        self.queries.append((query, kwargs))
+        response = next(self.responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+def needle_response(**flags):
+    return {
+        "function_calls": [{"name": name, "arguments": {}} for name, enabled in flags.items() if enabled]
+    }
+
+
 class QueueOrchestrator(ConversationOrchestrator):
     def __init__(self, *args, generated=None, **kwargs):
         self.generated = list(generated or [])
@@ -71,20 +94,21 @@ class QueueOrchestrator(ConversationOrchestrator):
 
 
 class IntentClassifierTests(unittest.TestCase):
-    def test_strict_parse_and_controlled_repair(self):
-        outputs = iter([
-            "```json\n{}\n```",
-            '{"memory_read":true,"memory_write":false,"document_read":false,"tool_use":false,"general_chat":false}',
-        ])
-        classifier = IntentClassifier(lambda messages, **kwargs: next(outputs), logger=lambda message: None)
+    def test_schema_constrained_needle_classification(self):
+        agent = FakeNeedleAgent([needle_response(
+            memory_read=True, memory_write=False, document_read=False,
+            tool_use=False, general_chat=False,
+        )])
+        classifier = IntentClassifier(agent, logger=lambda message: None)
 
         decision = classifier.classify("What is my name?", [])
 
         self.assertEqual(decision, IntentDecision(True, False, False, False))
         self.assertFalse(classifier.last_used_fallback)
+        self.assertEqual(agent.reset_calls, 1)
 
-    def test_malformed_output_uses_legacy_fallback(self):
-        classifier = IntentClassifier(lambda messages, **kwargs: "not json", logger=lambda message: None)
+    def test_invalid_needle_call_uses_safe_fallback(self):
+        classifier = IntentClassifier(FakeNeedleAgent([{"function_calls": "invalid"}]), logger=lambda message: None)
 
         decision = classifier.classify("anything", [])
 
@@ -92,13 +116,11 @@ class IntentClassifierTests(unittest.TestCase):
         self.assertTrue(classifier.last_used_fallback)
 
     def test_recent_context_excludes_system_retrieval_context(self):
-        captured = []
-
-        def generate(messages, **kwargs):
-            captured.append(messages)
-            return '{"memory_read":false,"memory_write":false,"document_read":true,"tool_use":false,"general_chat":false}'
-
-        classifier = IntentClassifier(generate, logger=lambda message: None)
+        agent = FakeNeedleAgent([needle_response(
+            memory_read=False, memory_write=False, document_read=True,
+            tool_use=False, general_chat=False,
+        )])
+        classifier = IntentClassifier(agent, logger=lambda message: None)
         history = [
             {"role": "system", "content": "SECRET RETRIEVED MEMORY AND DOCUMENT CHUNKS"},
             {"role": "user", "content": "What does the travel policy say about hotels?"},
@@ -106,7 +128,7 @@ class IntentClassifierTests(unittest.TestCase):
         ]
 
         classifier.classify("What about meals?", history)
-        prompt = captured[0][1]["content"]
+        prompt = agent.queries[0][0]
         self.assertIn("travel policy", prompt)
         self.assertIn("What about meals?", prompt)
         self.assertNotIn("SECRET RETRIEVED", prompt)
@@ -159,7 +181,7 @@ class DeterministicIntentRouterTests(unittest.TestCase):
             "I live in Pune now.",
         )
 
-    def test_question_is_a_high_confidence_non_write_even_if_qwen_disagrees(self):
+    def test_needle_decision_is_not_overridden_by_deterministic_router(self):
         classifier = StaticClassifier(IntentDecision(True, True, True, True))
         orchestrator = QueueOrchestrator(
             FakeTokenizer(),
@@ -170,8 +192,9 @@ class DeterministicIntentRouterTests(unittest.TestCase):
             logger=lambda message: None,
         )
         decision = orchestrator.classify_intent("What have I been coding in recently?", [])
-        self.assertEqual(decision, IntentDecision(True, False, False, False))
-        self.assertEqual(classifier.calls, [])
+        self.assertEqual(decision, IntentDecision(True, True, True, True))
+        self.assertEqual(len(classifier.calls), 1)
+        self.assertTrue(all(source == "needle_2" for source in orchestrator.last_intent_sources.values()))
 
     def test_general_chat_remains_independent_for_mixed_requests(self):
         evidence = self.router.analyze("What is my name and explain recursion.", [])
@@ -383,29 +406,11 @@ class OrchestrationRoutingTests(unittest.TestCase):
         self.assertNotIn("confirmed information about the user", messages[0]["content"].lower())
         self.assertNotIn("Background Profile Info", messages[0]["content"])
 
-    def test_malformed_classifier_fallback_cannot_turn_a_question_into_a_write(self):
-        memory = FakeMemory()
-        documents = []
-        classifier = IntentClassifier(lambda messages, **kwargs: "invalid", logger=lambda message: None)
-        orchestrator = QueueOrchestrator(
-            FakeTokenizer(),
-            object(),
-            memory,
-            generated=["answer"],
-            intent_classifier=classifier,
-            document_lookup=lambda query: documents.append(query) or DocumentRetrievalResult(),
-            logger=lambda message: None,
-        )
-
-        orchestrator.process_turn(
-            "What about that?",
-            [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}],
-            turn_number=1,
-        )
-
-        self.assertEqual(memory.read_calls, ["What about that?"])
-        self.assertEqual(memory.router_calls, [])
-        self.assertEqual(documents, ["What about that?"])
+    def test_failed_needle_classification_uses_conservative_fallback(self):
+        classifier = IntentClassifier(FakeNeedleAgent([RuntimeError("failed")]), logger=lambda message: None)
+        decision = classifier.classify("What about that?", [])
+        self.assertEqual(decision, IntentDecision.legacy_fallback())
+        self.assertTrue(classifier.last_used_fallback)
 
     def test_document_context_is_trimmed_to_configured_budget(self):
         blocks = [f"Source: file{index}.txt, lines 1-2\n" + ("word " * 55) for index in range(3)]
@@ -463,7 +468,7 @@ class OrchestrationRoutingTests(unittest.TestCase):
         self.assertIn("without hedging", memory_prompt)
         self.assertIn("Use only facts that directly answer", memory_prompt)
 
-    def test_implicit_company_question_reaches_document_lookup_without_semantic_override(self):
+    def test_needle_owns_implicit_company_question_routing(self):
         query = (
             "I am a remote employee. What equipment does the company provide me, what security requirements "
             "apply to my laptop, and who should I contact about device security?"
@@ -481,10 +486,10 @@ class OrchestrationRoutingTests(unittest.TestCase):
             document_result=document_result,
         )
 
-        self.assertEqual(orchestrator.intent_classifier.calls, [])
-        self.assertEqual(document_calls, [query])
+        self.assertEqual(len(orchestrator.intent_classifier.calls), 1)
+        self.assertEqual(document_calls, [])
         self.assertEqual(memory.read_calls, [])
-        self.assertIn("company_policy.txt", result[0][0]["content"])
+        self.assertNotIn("company_policy.txt", result[0][0]["content"])
 
     def test_explicit_user_formulas_and_fallbacks_are_authoritative_in_response_prompt(self):
         rules = (

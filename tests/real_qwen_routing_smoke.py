@@ -1,7 +1,7 @@
-"""Non-destructive real-Qwen smoke test for raw semantic and final hybrid routing.
+"""Non-destructive real-Needle-2 smoke test for intent routing.
 
-This module is intentionally outside unittest discovery. It loads Qwen but never
-constructs a memory manager, document index, or SQLite connection.
+This module is intentionally outside unittest discovery. It loads Needle 2 but
+never constructs a memory manager, document index, or SQLite connection.
 """
 
 from __future__ import annotations
@@ -12,14 +12,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-
 from intent_classifier import IntentClassifier, IntentDecision
 from orchestrator import ConversationOrchestrator
 
 
-MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
+MODEL_ID = "Cactus-Compute/needle2"
 
 
 def as_dict(decision: IntentDecision) -> dict[str, bool]:
@@ -33,26 +30,15 @@ def as_dict(decision: IntentDecision) -> dict[str, bool]:
 
 
 def main() -> int:
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
-        quantization_config=BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        ),
-        dtype="auto",
-        device_map="auto",
-    )
-    model.eval()
+    classifier = IntentClassifier(logger=lambda message: None)
     orchestrator = ConversationOrchestrator(
-        tokenizer,
-        model,
+        object(),
+        object(),
         memory=object(),
+        intent_classifier=classifier,
         logger=lambda message: None,
     )
-    semantic_classifier: IntentClassifier = orchestrator.intent_classifier
+    semantic_classifier: IntentClassifier = classifier
 
     cases = [
         ("My name is Anish.", IntentDecision(False, True, False, False)),
@@ -71,14 +57,14 @@ def main() -> int:
     failed = False
     for message, expected in cases:
         raw_semantic = semantic_classifier.classify(message, [])
-        final_hybrid = orchestrator.classify_intent(message, [])
-        passed = final_hybrid == expected
+        final_needle = orchestrator.classify_intent(message, [])
+        passed = final_needle == expected
         failed = failed or not passed
         records.append(
             {
                 "message": message,
-                "raw_qwen": as_dict(raw_semantic),
-                "final_hybrid": as_dict(final_hybrid),
+                "raw_needle": as_dict(raw_semantic),
+                "final_needle": as_dict(final_needle),
                 "expected": as_dict(expected),
                 "sources": dict(orchestrator.last_intent_sources),
                 "passed": passed,
@@ -105,15 +91,15 @@ def main() -> int:
     ]
     for message, history, expected in contextual_cases:
         raw_semantic = semantic_classifier.classify(message, history)
-        final_hybrid = orchestrator.classify_intent(message, history)
-        passed = final_hybrid == expected
+        final_needle = orchestrator.classify_intent(message, history)
+        passed = final_needle == expected
         failed = failed or not passed
         records.append(
             {
                 "message": message,
                 "context": history,
-                "raw_qwen": as_dict(raw_semantic),
-                "final_hybrid": as_dict(final_hybrid),
+                "raw_needle": as_dict(raw_semantic),
+                "final_needle": as_dict(final_needle),
                 "expected": as_dict(expected),
                 "sources": dict(orchestrator.last_intent_sources),
                 "passed": passed,

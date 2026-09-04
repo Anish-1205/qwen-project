@@ -87,7 +87,7 @@ Focused routing regression and the final representative routing matrix.
 
 ## TOOL-QWEN-001 — Real-Qwen tool emission remains unreliable
 
-**Status:** Open  
+**Status:** Open
 **Severity:** Medium  
 **Area:** Tools / Model integration
 
@@ -398,7 +398,7 @@ This change does not provide intraday/tradable market prices.
 
 ## TOOL-PATH-001 — Local tools have no root allowlist
 
-**Status:** Open  
+**Status:** Fixed
 **Severity:** High  
 **Area:** Tools / Security
 
@@ -415,13 +415,14 @@ exercise temporary paths and do not cover traversal outside an allowed root.
 No allowed-root policy exists in current configuration.
 
 **Fix**  
-None in this task. Choosing default roots changes an intentional local-file
-capability and needs an explicit product policy; path restrictions were not
-weakened to run tests.
+Local file and directory paths must resolve beneath an allowlisted root. The
+default is the project root; `TOOLS_ALLOWED_ROOTS` can declare multiple explicit
+roots using the operating system path separator. The check occurs after path
+resolution, so traversal and symlink escapes are rejected.
 
 **Verification**  
-Current-code inspection. A dedicated security task should define configurable
-roots and add traversal, symlink, and multi-path regressions.
+Regression coverage verifies allowed reads/listings plus absolute and traversal
+attempts outside the configured root.
 
 ## ENV-START-001 — Current model load exits without Python diagnostics
 
@@ -476,7 +477,7 @@ not more environment tuning.
 
 ## WEB-UPLOAD-001 — Upload endpoint lacks backend bounds
 
-**Status:** Open  
+**Status:** Fixed
 **Severity:** Medium  
 **Area:** Web / Documents
 
@@ -493,15 +494,17 @@ or collision checks.
 Backend validation was not implemented.
 
 **Fix**  
-None; outside this task's implementation scope.
+The endpoint reads at most 10,000,001 bytes and rejects bodies over the
+10,000,000-byte limit. Only `.txt` and `.pdf` basenames are accepted, and files
+are created exclusively so an existing document is never overwritten.
 
 **Verification**  
-Current-code inspection. Add isolated endpoint tests in a dedicated web hardening
-task.
+Isolated regressions cover accepted uploads, unsupported extensions, oversized
+content, and collision preservation.
 
 ## LOG-PRIVACY-001 — Debug log retains sensitive conversation content
 
-**Status:** Open  
+**Status:** Fixed
 **Severity:** Medium  
 **Area:** Logging / Privacy
 
@@ -518,15 +521,17 @@ separate bounded redaction, but general turn content does not.
 General diagnostic logging predates a retention/redaction policy.
 
 **Fix**  
-None; outside this task's implementation scope. New tool-stage diagnostics do
-not include raw model output or new prompt content.
+Prompt assembly and assistant-reply log events now record only character counts,
+not content. Debug output uses a 5 MB rotating handler with three backups.
+Existing bounded tool-payload redaction remains in place.
 
 **Verification**  
-Current code and existing local log inspection.
+Focused orchestration and logger tests pass with the content-free event format
+and rotating handler.
 
 ## DEP-REPRO-001 — Dependency set is unpinned
 
-**Status:** Open  
+**Status:** Fixed
 **Severity:** Low  
 **Area:** Dependencies / Environment
 
@@ -542,7 +547,9 @@ bitsandbytes 0.50.1.
 A platform-aware lock/pinning strategy has not been adopted.
 
 **Fix**  
-None; outside this task's implementation scope.
+All direct dependencies are pinned to the versions in the verified project
+environment. CUDA-specific PyTorch installation remains platform-dependent as
+documented in the setup notes.
 
 **Verification**  
-Current dependency file and environment inspection.
+The pinned versions match the active `qwen-env` package set used by the suite.

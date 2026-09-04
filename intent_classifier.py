@@ -1,12 +1,11 @@
-"""Classify independent turn intents with deterministic and model evidence.
+"""Classify turn intents with Needle 2 structured inference.
 
-The router resolves high-confidence lexical cases first and asks Qwen only for
-flags that remain ambiguous, keeping routing predictable and inexpensive.
+``DeterministicIntentRouter`` remains for a few text-extraction helpers used by
+the orchestration layer, but it no longer participates in intent decisions.
 """
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 from typing import Callable, Sequence
@@ -590,43 +589,71 @@ class DeterministicIntentRouter:
 
 
 class IntentClassifier:
-    """Small deterministic Qwen pass that selects participating subsystems."""
+    """Use Needle 2 as the sole intent classifier for every routing flag."""
 
     REQUIRED_KEYS = {"memory_read", "memory_write", "document_read", "tool_use", "general_chat"}
 
     def __init__(
         self,
-        generate: Callable[..., str],
+        needle_agent=None,
         *,
         logger: Callable[[str], None] = print,
-        generation_kwargs: dict | None = None,
         recent_message_limit: int = 4,
         recent_message_chars: int = 600,
+        max_new_tokens: int = 128,
     ) -> None:
-        self.generate = generate
         self.logger = logger
-        self.generation_kwargs = generation_kwargs or {
-            "max_new_tokens": 72,
-            "do_sample": False,
-        }
         self.recent_message_limit = recent_message_limit
         self.recent_message_chars = recent_message_chars
+        self.max_new_tokens = max_new_tokens
+        self._agent = needle_agent
         self.last_used_fallback = False
         self.last_error = ""
 
-    @classmethod
-    def parse_decision(cls, raw: str) -> IntentDecision:
-        candidate = (raw or "").strip()
-        try:
-            payload = json.loads(candidate)
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise ValueError("classifier output is not a JSON object") from exc
+    @staticmethod
+    def _schemas() -> list[dict]:
+        """Expose intents as Needle-native routes instead of asking it to emit prose JSON."""
+        descriptions = {
+            "memory_read": "Retrieve durable personal facts previously supplied by the user, such as their name, location, job, or preferences.",
+            "memory_write": "Store or update a durable personal fact supplied by the user. Questions and facts solely about other people do not use this route.",
+            "document_read": "Read local/uploaded files or internal organization knowledge such as company policies, benefits, procedures, and contacts.",
+            "tool_use": "Perform requested calculations, current weather or currency lookup, web search, URL fetch, local file/spreadsheet operation, or random result.",
+            "general_chat": "Answer greetings, writing or explanation requests, and general-knowledge questions conversationally.",
+        }
+        return [
+            {
+                "name": name,
+                "description": description,
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            }
+            for name, description in descriptions.items()
+        ]
 
-        if not isinstance(payload, dict) or set(payload) != cls.REQUIRED_KEYS:
-            raise ValueError("classifier output has an invalid key set")
-        if any(type(payload[key]) is not bool for key in cls.REQUIRED_KEYS):
-            raise ValueError("classifier flags must be JSON booleans")
-        return IntentDecision(**payload)
+    def _get_agent(self):
+        if self._agent is None:
+            try:
+                import needle
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Needle 2 is required for intent classification; install cactus-needle"
+                ) from exc
+            self._agent = needle.Needle(tools=self._schemas())
+        return self._agent
+
+    @classmethod
+    def parse_decision(cls, calls: list[dict]) -> IntentDecision:
+        if not isinstance(calls, list):
+            raise ValueError("Needle function_calls is not a list")
+        selected = {call.get("name") for call in calls if isinstance(call, dict)}
+        unknown = selected - cls.REQUIRED_KEYS
+        if unknown:
+            raise ValueError(f"Needle returned unknown intent routes: {sorted(unknown)}")
+        # Needle's documented off-topic contract is an empty call list. In this
+        # routing toolset, off-topic means no subsystem is needed and the normal
+        # conversational model should answer.
+        if not selected:
+            selected.add("general_chat")
+        return IntentDecision(**{key: key in selected for key in cls.REQUIRED_KEYS})
 
     def _recent_context(self, messages: Sequence[dict]) -> str:
         eligible = [message for message in messages if message.get("role") in {"user", "assistant"}]
@@ -638,70 +665,19 @@ class IntentClassifier:
                 rendered.append(f"{role}: {content}")
         return "\n".join(rendered) if rendered else "(none)"
 
-    def _classification_messages(self, user_input: str, recent_messages: Sequence[dict]) -> list[dict]:
-        return [
-            {
-                "role": "system",
-                "content": (
-                    "You route the CURRENT user message for a local assistant. Return exactly one JSON object with five boolean keys: "
-                    "memory_read, memory_write, document_read, tool_use, general_chat. The flags are independent. "
-                    "Use recent conversation only to resolve references such as 'that' or 'what about meals'; never copy a prior turn's intent onto the current message. "
-                    "memory_read means the current message asks for durable personal facts previously supplied by the speaker. "
-                    "Set it even if the recent transcript appears to contain the answer; recent chat is not a substitute for confirmed memory. "
-                    "memory_write means the current message supplies or updates a durable fact about the speaker, even when phrased as a casual statement, or explicitly asks "
-                    "to remember/update a durable fact from the recent exchange. Facts solely about other named people are "
-                    "not writable personal memory. A recall question is not a write merely because the preceding turn was an update. "
-                    "document_read means local/uploaded files are needed, including a clear "
-                    "follow-up to a file discussion. Organization-specific facts such as internal rules, employee benefits, "
-                    "employer-provided resources, procedures, and responsible internal contacts also require document_read "
-                    "even when no file is named; generic questions about companies do not. Words such as 'knowledge' or 'update' alone do not imply documents. "
-                    "tool_use means the assistant must execute a registered utility: search the web, fetch a user-supplied URL, get current weather or exchange-rate data, read/list a local path, analyze a spreadsheet, calculate arithmetic, or produce a die/random result. Discussion about those topics is not tool use. "
-                    "general_chat means some part can be answered from ordinary conversation or model knowledge. Use recent "
-                    "context only to resolve references. Examples: capital question => only general_chat; 'what is my name?' or "
-                    "'where do I live?' or 'what is my favorite language?' => only memory_read; 'I moved to Pune', 'I live in Hyderabad now', "
-                    "or 'I have started coding in TypeScript' => memory_write (and optionally general_chat); travel-policy question => only "
-                    "document_read; name plus capital => memory_read and general_chat; remember a preference plus ask about "
-                    "a policy => memory_write and document_read. Do not add prose or markdown."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Recent conversation:\n{self._recent_context(recent_messages)}\n\nCurrent message:\n{user_input}",
-            },
-        ]
-
     def classify(self, user_input: str, recent_messages: Sequence[dict]) -> IntentDecision:
         self.last_used_fallback = False
         self.last_error = ""
-        messages = self._classification_messages(user_input, recent_messages)
-
         try:
-            first_output = self.generate(messages, **self.generation_kwargs)
-            return self.parse_decision(first_output)
-        except Exception as first_exc:
-            first_error = str(first_exc)
-
-        try:
-            repair_messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "Return exactly one valid JSON object with these keys and JSON boolean values only: "
-                        "memory_read, memory_write, document_read, tool_use, general_chat. No markdown or prose."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"The prior classification was invalid ({first_error}). Reclassify this message:\n"
-                        f"{user_input}\n\nRecent context:\n{self._recent_context(recent_messages)}"
-                    ),
-                },
-            ]
-            repaired_output = self.generate(repair_messages, **self.generation_kwargs)
-            return self.parse_decision(repaired_output)
-        except Exception as repair_exc:
+            agent = self._get_agent()
+            agent.reset()
+            context = self._recent_context(recent_messages)
+            query = user_input if context == "(none)" else f"Previous conversation:\n{context}\n\n{user_input}"
+            response = agent.complete(query, max_new_tokens=self.max_new_tokens)
+            calls = response.get("function_calls", []) if isinstance(response, dict) else []
+            return self.parse_decision(calls)
+        except Exception as exc:
             self.last_used_fallback = True
-            self.last_error = f"initial={first_error}; repair={repair_exc}"
-            self.logger(f"[Intent] Warning: classifier validation failed; using legacy fallback ({self.last_error}).")
+            self.last_error = str(exc)
+            self.logger(f"[Intent] Warning: Needle 2 classification failed; using safe fallback ({self.last_error}).")
             return IntentDecision.legacy_fallback()

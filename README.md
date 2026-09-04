@@ -17,7 +17,7 @@ features that intentionally make outbound requests.
 - Validated tools for calculations, random values, daily currency reference
   rates, structured web search, weather, webpage text, local file reading,
   directory listing, and spreadsheet analysis.
-- Hybrid deterministic/model intent routing and bounded context compression.
+- Fully Needle 2-powered structured intent classification and bounded context compression.
 - A broad test suite that does not require loading Qwen for normal unit tests.
 
 ## Architecture
@@ -27,7 +27,7 @@ chat.py / infer.py / webapp.py
               |
               v
    ConversationOrchestrator
-      |-- intent routing
+      |-- Needle 2 intent classification
       |-- OfflineMemoryManager --> data/agent_memory.db
       |-- DocumentIndex ---------> data/documents.db + knowledge/
       |-- ToolManager -----------> allowlisted local/web tools
@@ -35,16 +35,16 @@ chat.py / infer.py / webapp.py
 ```
 
 Runtime databases, logs, model caches, and virtual environments are deliberately
-excluded from Git. See [the project handoff](docs/PROJECT_HANDOFF.md) for the
-turn lifecycle and [the detailed audit](docs/PROJECT_AUDIT_FULL.md) for design
-decisions and known limitations.
+excluded from Git. See the [Needle2 benchmark plan](docs/NEEDLE2_BENCHMARK_PLAN.md)
+for this branch's evaluation scope and the [issue ledger](docs/PROJECT_ISSUES.md)
+for verified changes. The older handoff and audit remain historical context.
 
 ## Requirements
 
 - Python 3.11 or newer.
 - An NVIDIA GPU and a working CUDA-enabled PyTorch installation are strongly
   recommended for the configured 4-bit model.
-- Enough disk space for Qwen and `BAAI/bge-small-en-v1.5` in the Hugging Face
+- Enough disk space for Qwen, Needle 2, and `BAAI/bge-small-en-v1.5` in the Hugging Face
   cache.
 
 `bitsandbytes` and CUDA support vary by operating system and hardware. Install
@@ -120,6 +120,7 @@ Storage and document settings can be overridden with environment variables:
 | `CHATBOT_DOC_CHUNK_SIZE` | Approximate chunk tokens | `350` |
 | `CHATBOT_DOC_CHUNK_OVERLAP` | Approximate overlap tokens | `60` |
 | `CHATBOT_DOC_TOP_K` | Maximum retrieved chunks | `4` |
+| `TOOLS_ALLOWED_ROOTS` | Local-tool roots, separated by the OS path separator | Project root |
 
 Tool safety and size limits use `TOOLS_*` variables documented alongside their
 defaults in [`tools/config.py`](tools/config.py). Private-network webpage access
@@ -141,6 +142,10 @@ Run the fast automated suite without loading the Qwen model:
 python -m pytest
 ```
 
+The deterministic suite was last verified on 2026-09-04: **143 tests and 57
+subtests passed**. Live Qwen generation and external API calls are not part of
+this command.
+
 The real-model routing smoke test is intentionally outside normal discovery
 because it is GPU- and download-intensive:
 
@@ -157,7 +162,7 @@ or the executable tool registry.
 - `webapp.py` - FastAPI server and embedded browser UI.
 - `infer.py` - stateless CLI variant.
 - `orchestrator.py` - shared turn pipeline and tool loop.
-- `intent_classifier.py` - hybrid intent decisions.
+- `intent_classifier.py` - schema-constrained Needle 2 intent decisions.
 - `memory_core.py` - durable fact extraction and retrieval.
 - `documents/` - document discovery, extraction, indexing, and retrieval.
 - `tools/` - schemas, validation, and allowlisted implementations.
@@ -170,9 +175,8 @@ or the executable tool registry.
   tradable market prices.
 - Web search requires a separately provisioned Tavily API key and returns
   result metadata/snippets, not rendered or authenticated webpage content.
-- The dependency list is unpinned and a clean install is not yet continuously
-  verified.
-- Web reset behavior and upload validation need hardening.
-- Logs are not rotated and can contain prompts or document text.
+- Web reset behavior needs hardening.
+- Diagnostic logs contain operational metadata and bounded tool payloads; protect
+  the local `data/` directory accordingly.
 - Retrieval is brute-force and intended for a modest local document collection.
 - This repository does not currently declare an open-source license.

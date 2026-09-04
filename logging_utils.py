@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import re
 import os
 import subprocess
@@ -183,7 +184,7 @@ def setup_debug_logger(log_path: str | Path = DEFAULT_LOG_PATH) -> tuple[logging
         logger.removeHandler(handler)
         handler.close()
 
-    handler = logging.FileHandler(resolved_path, encoding="utf-8")
+    handler = RotatingFileHandler(resolved_path, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
     handler.setLevel(logging.DEBUG)
     handler.setFormatter(DebugLogFormatter())
     logger.addHandler(handler)

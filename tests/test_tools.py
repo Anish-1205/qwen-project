@@ -28,7 +28,9 @@ class StaticClassifier:
     last_used_fallback = False
 
     def classify(self, user_input, messages):
-        return IntentDecision(False, False, False, True)
+        if user_input == "Hello!":
+            return IntentDecision(False, False, False, True, False)
+        return IntentDecision(False, False, False, False, True)
 
 
 class QueueOrchestrator(ConversationOrchestrator):

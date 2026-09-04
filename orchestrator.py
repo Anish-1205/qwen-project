@@ -124,7 +124,6 @@ class ConversationOrchestrator:
         document_lookup: Callable[[str], DocumentRetrievalResult | None] | None = None,
         intent_classifier: IntentClassifier | None = None,
         deterministic_intent_router: DeterministicIntentRouter | None = None,
-        intent_generation_kwargs: dict | None = None,
         tool_manager: ToolManager | None = None,
         logger: Callable[[str], None] = print,
     ):
@@ -151,11 +150,7 @@ class ConversationOrchestrator:
         }
         self.document_lookup = document_lookup
         self.logger = logger
-        self.intent_classifier = intent_classifier or IntentClassifier(
-            self.generate_reply,
-            logger=logger,
-            generation_kwargs=intent_generation_kwargs,
-        )
+        self.intent_classifier = intent_classifier or IntentClassifier(logger=logger)
         self.deterministic_intent_router = deterministic_intent_router or DeterministicIntentRouter()
         self.tool_manager = tool_manager or ToolManager()
         self.last_tool_execution: ToolExecutionResult | None = None
@@ -192,37 +187,20 @@ class ConversationOrchestrator:
         return "\n\n".join(prompt_parts)
 
     def classify_intent(self, user_input: str, messages: Sequence[dict]) -> IntentDecision:
-        evidence = self.deterministic_intent_router.analyze(user_input, messages)
-        semantic_decision: IntentDecision | None = None
-        if not evidence.complete:
-            try:
-                semantic_decision = self.intent_classifier.classify(user_input, messages)
-                if not isinstance(semantic_decision, IntentDecision):
-                    raise TypeError("intent classifier returned an invalid decision type")
-            except Exception as exc:
-                self.logger(f"[Intent] Warning: semantic classifier failed; using legacy fallback ({exc}).")
-                semantic_decision = IntentDecision.legacy_fallback()
+        try:
+            decision = self.intent_classifier.classify(user_input, messages)
+            if not isinstance(decision, IntentDecision):
+                raise TypeError("intent classifier returned an invalid decision type")
+        except Exception as exc:
+            self.logger(f"[Intent] Warning: Needle 2 classifier failed; using safe fallback ({exc}).")
+            decision = IntentDecision.legacy_fallback()
 
-        self.last_semantic_intent_decision = semantic_decision
-        fallback = semantic_decision or IntentDecision(False, False, False, False, False)
-        values: dict[str, bool] = {}
-        sources: dict[str, str] = {}
-        reasons: dict[str, str] = {}
-        semantic_used_fallback = bool(getattr(self.intent_classifier, "last_used_fallback", False))
-        for flag in ("memory_read", "memory_write", "document_read", "tool_use", "general_chat"):
-            deterministic_value = getattr(evidence, flag)
-            if deterministic_value is not None:
-                values[flag] = deterministic_value
-                sources[flag] = evidence.source_for(flag)
-                reasons[flag] = evidence.reason_for(flag)
-            else:
-                values[flag] = getattr(fallback, flag)
-                sources[flag] = "fallback" if semantic_used_fallback else "semantic_llm"
-                reasons[flag] = "deterministic evidence was inconclusive"
-
-        self.last_intent_sources = sources
-        self.last_intent_reasons = reasons
-        return IntentDecision(**values)
+        self.last_semantic_intent_decision = decision
+        used_fallback = bool(getattr(self.intent_classifier, "last_used_fallback", False))
+        source = "fallback" if used_fallback else "needle_2"
+        self.last_intent_sources = {flag: source for flag in IntentClassifier.REQUIRED_KEYS}
+        self.last_intent_reasons = {flag: "classified by Needle 2" for flag in IntentClassifier.REQUIRED_KEYS}
+        return decision
 
     def _format_intent_log(self, intent: IntentDecision) -> str:
         rendered: list[str] = []
@@ -866,7 +844,7 @@ class ConversationOrchestrator:
         system_message = conversation_messages[0]["content"]
         self.logger(f"[Turn {turn_number}] [Prompt Assembly] Facts injected into system message: {'yes' if memory_context else 'no'}")
         self.logger(f"[Turn {turn_number}] [Prompt Assembly] Document context injected: {'yes' if document_result.context else 'no'}")
-        self.logger(f"[Turn {turn_number}] [Prompt Assembly] Final system message:\n    {system_message.replace(chr(10), chr(10) + '    ')}")
+        self.logger(f"[Turn {turn_number}] [Prompt Assembly] Final system message omitted from logs (characters={len(system_message)}).")
 
         if intent.tool_use:
             reply = self.generate_tool_aware_reply(conversation_messages, turn_number=turn_number)
@@ -876,7 +854,7 @@ class ConversationOrchestrator:
             reply = self.generate_reply(conversation_messages)
         if reply_postprocess is not None:
             reply = reply_postprocess(reply)
-        self.logger(f"[Turn {turn_number}] [Assistant Reply] \"{reply}\"")
+        self.logger(f"[Turn {turn_number}] [Assistant Reply] Content omitted from logs (characters={len(reply)}).")
 
         if maintain_history:
             messages.append({"role": "assistant", "content": reply})

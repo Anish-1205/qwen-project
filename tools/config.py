@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import os
 import math
+from pathlib import Path
+
+from app_paths import PROJECT_ROOT
 
 
 def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -55,6 +58,15 @@ SPREADSHEET_MAX_ROWS = _bounded_int("TOOLS_SPREADSHEET_MAX_ROWS", 100_000, 1, 1_
 SPREADSHEET_MAX_CELLS = _bounded_int("TOOLS_SPREADSHEET_MAX_CELLS", 1_000_000, 1, 10_000_000)
 MAX_LOG_PAYLOAD_CHARS = _bounded_int("TOOLS_MAX_LOG_PAYLOAD_CHARS", 2_000, 200, 20_000)
 ALLOW_PRIVATE_WEB_HOSTS = _env_bool("TOOLS_ALLOW_PRIVATE_WEB_HOSTS", False)
+
+
+def _allowed_roots() -> tuple[Path, ...]:
+    value = os.environ.get("TOOLS_ALLOWED_ROOTS")
+    raw_roots = value.split(os.pathsep) if value else [str(PROJECT_ROOT)]
+    return tuple(Path(item).expanduser().resolve() for item in raw_roots if item.strip())
+
+
+LOCAL_ALLOWED_ROOTS = _allowed_roots()
 WEATHER_MAX_FORECAST_DAYS = _bounded_int("TOOLS_WEATHER_MAX_FORECAST_DAYS", 7, 1, 14)
 CURRENCY_MAX_AMOUNT = _bounded_float("TOOLS_CURRENCY_MAX_AMOUNT", 1_000_000_000_000.0, 1.0, 1_000_000_000_000_000.0)
 CURRENCY_MAX_RESPONSE_BYTES = _bounded_int("TOOLS_CURRENCY_MAX_RESPONSE_BYTES", 65_536, 4_096, 1_000_000)

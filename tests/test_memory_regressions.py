@@ -747,7 +747,7 @@ class MemoryRegressionTests(unittest.TestCase):
             compression_enabled=True,
             max_context_tokens=80,
             keep_recent_turns=1,
-            intent_classifier=StaticClassifier(IntentDecision(False, False, False, True)),
+            intent_classifier=StaticClassifier(IntentDecision(True, False, False, False)),
             logger=lambda message: None,
         )
         messages = [
@@ -816,7 +816,7 @@ class MemoryRegressionTests(unittest.TestCase):
 
         self.assertEqual([(row[2], row[3]) for row in self._rows()], [("codes_in", "Python")])
 
-    def test_hybrid_orchestration_routes_and_grounds_the_real_smoke_sequence(self):
+    def test_needle_owned_orchestration_routes_and_grounds_the_real_smoke_sequence(self):
         extraction_outputs = {
             "My name is Anish.": "user | name | Anish | The user's name is Anish.",
             "I live in Hyderabad now.": "user | lives_in | Hyderabad | The user lives in Hyderabad.",
@@ -850,12 +850,24 @@ class MemoryRegressionTests(unittest.TestCase):
             return original_read(query)
 
         self.memory.get_orchestrated_context = tracked_read
+        class SequenceClassifier:
+            last_used_fallback = False
+
+            def classify(self, user_input, messages):
+                if user_input.startswith(("What is my", "Where do I", "What programming", "What have I")):
+                    return IntentDecision(True, False, False, False)
+                if user_input == "What about meals?":
+                    return IntentDecision(False, False, True, False)
+                if user_input == "What is the capital of India?":
+                    return IntentDecision(False, False, False, True)
+                return IntentDecision(False, True, False, False)
+
         orchestrator = GroundedSequenceOrchestrator(
             FakeTokenizer(),
             object(),
             self.memory,
             extraction_outputs=extraction_outputs,
-            intent_classifier=StaticClassifier(IntentDecision(False, False, False, True)),
+            intent_classifier=SequenceClassifier(),
             document_lookup=lambda query: document_calls.append(query),
             logger=lambda message: None,
         )

@@ -45,6 +45,8 @@ SESSION_COOKIE = "roots_chat_session"
 APP_TITLE = "Roots Chat"
 DEFAULT_SESSION_TITLE = "New Chat"
 SESSION_TITLE_MAX_LENGTH = 48
+DOCUMENT_UPLOAD_MAX_BYTES = 10_000_000
+DOCUMENT_UPLOAD_EXTENSIONS = {".pdf", ".txt"}
 
 MARKDOWN_RENDERER = MarkdownIt("commonmark", {"html": False, "linkify": False, "typographer": False})
 MARKDOWN_ALLOWED_TAGS = {
@@ -401,8 +403,18 @@ def _save_uploaded_document(filename: str, content: bytes) -> Path:
   docs_root = _get_documents_root()
   docs_root.mkdir(parents=True, exist_ok=True)
   safe_name = Path(filename).name
+  if not safe_name or safe_name in {".", ".."}:
+    raise HTTPException(status_code=400, detail="Invalid filename")
+  if Path(safe_name).suffix.lower() not in DOCUMENT_UPLOAD_EXTENSIONS:
+    raise HTTPException(status_code=415, detail="Only .txt and .pdf documents are supported")
+  if len(content) > DOCUMENT_UPLOAD_MAX_BYTES:
+    raise HTTPException(status_code=413, detail="Document exceeds the upload size limit")
   target = docs_root / safe_name
-  target.write_bytes(content)
+  try:
+    with target.open("xb") as output:
+      output.write(content)
+  except FileExistsError as exc:
+    raise HTTPException(status_code=409, detail="A document with that filename already exists") from exc
   return target
 
 
@@ -2254,7 +2266,7 @@ async def upload_document(file: UploadFile = File(...)) -> dict:
     raise HTTPException(status_code=400, detail="Missing filename")
 
   try:
-    content = await file.read()
+    content = await file.read(DOCUMENT_UPLOAD_MAX_BYTES + 1)
     saved_path = _save_uploaded_document(file.filename, content)
     sync_summary = _sync_documents()
     return {

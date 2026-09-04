@@ -14,6 +14,7 @@ from intent_classifier import DeterministicIntentRouter, IntentClassifier, Inten
 from orchestrator import ConversationOrchestrator, DEFAULT_SYSTEM_PROMPT
 from logging_utils import sanitize_tool_log_payload
 from tools import ToolCall, ToolManager
+from tools import config as tool_config
 from tools.directory_listing import list_directory
 from tools.common import validate_public_url
 from tools.config import _bounded_int
@@ -21,6 +22,11 @@ from tools.file_reader import read_file
 from tools.spreadsheet import analyze_spreadsheet
 from tools.weather import FORECAST_URL, GEOCODING_URL, weather
 from tools.web_fetch import fetch_webpage
+
+
+@pytest.fixture(autouse=True)
+def allow_test_workspace(tmp_path, monkeypatch):
+    monkeypatch.setattr(tool_config, "LOCAL_ALLOWED_ROOTS", (Path.cwd().resolve(), tmp_path.resolve()))
 
 
 def _xlsx(path: Path, rows, title="Data"):
@@ -297,10 +303,16 @@ def test_routing_tool_flags_semantic_repair_and_mixed():
     assert router.analyze("Remember I prefer metric units and get current weather in Pune", []).tool_use is True
     mixed_document = router.analyze("What does the travel policy say, and get current weather in Pune?", [])
     assert mixed_document.document_read is True and mixed_document.tool_use is True
-    outputs = iter(["bad", '{"memory_read":false,"memory_write":false,"document_read":false,"tool_use":true,"general_chat":false}'])
-    classifier = IntentClassifier(lambda messages, **kwargs: next(outputs), logger=lambda _: None)
+    class Agent:
+        def reset(self): pass
+        def complete(self, query, **kwargs):
+            return {"function_calls": [{"name": "tool_use", "arguments": {}}]}
+    classifier = IntentClassifier(Agent(), logger=lambda _: None)
     assert classifier.classify("Handle this utility request", []).tool_use is True
-    broken = IntentClassifier(lambda messages, **kwargs: "bad", logger=lambda _: None)
+    class BrokenAgent:
+        def reset(self): pass
+        def complete(self, query, **kwargs): return {"function_calls": "invalid"}
+    broken = IntentClassifier(BrokenAgent(), logger=lambda _: None)
     assert broken.classify("Handle this", []).tool_use is False
 
 
@@ -362,8 +374,15 @@ class FakeTokenizer:
 class FakeMemory:
     last_retrieval_stats = {"facts": []}
 
+class ToolIntentClassifier:
+    def classify(self, user_input, messages):
+        return IntentDecision(False, False, False, False, True)
+
 class QueueOrchestrator(ConversationOrchestrator):
-    def __init__(self, outputs, **kwargs): self.outputs=list(outputs); self.inputs=[]; self.overrides=[]; super().__init__(FakeTokenizer(), object(), FakeMemory(), logger=kwargs.pop("logger", lambda _: None), **kwargs)
+    def __init__(self, outputs, **kwargs):
+        self.outputs=list(outputs); self.inputs=[]; self.overrides=[]
+        kwargs.setdefault("intent_classifier", ToolIntentClassifier())
+        super().__init__(FakeTokenizer(), object(), FakeMemory(), logger=kwargs.pop("logger", lambda _: None), **kwargs)
     def generate_reply(self, messages, **overrides):
         self.inputs.append([dict(m) for m in messages]); self.overrides.append(overrides)
         return self.outputs.pop(0)
